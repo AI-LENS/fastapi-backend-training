@@ -1,0 +1,53 @@
+---
+title: "04 · Solution"
+description: "Configurable list limit via settings."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/config.py {18}
+class Settings(BaseSettings):
+    # ...existing fields...
+
+    # Pagination
+    default_list_limit: int = 50
+```
+
+```python app/routers/screenings.py {1, 17}
+from app.config import settings
+
+# ...
+
+@router.get("", response_model=list[ScreeningResponse])
+def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = settings.default_list_limit,
+):
+    """List screenings, optionally filtered by site or status."""
+    items = list(_screenings.values())
+    if site_id:
+        items = [s for s in items if s["site_id"] == site_id]
+    if status:
+        items = [s for s in items if s["status"] == status]
+    return items[:limit]
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why does importing `settings` at module top work?">
+    Python evaluates default argument values **once when the function is defined**, not at every call. `settings.default_list_limit` is read at import time and baked into the function signature. To change it without restarting, you'd need a `Depends`-based approach (Module 10).
+  </Accordion>
+  <Accordion title="Should I always use settings instead of hardcoded values?">
+    No. Hardcode things that *belong in code* (HTTP status mappings, business rules). Externalize things that *vary per environment* (DB URL, log level, feature flags, page sizes you might tune).
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 05: SQLAlchemy" icon="database" href="/modules/05-sqlalchemy">
+  Real database time.
+</Card>

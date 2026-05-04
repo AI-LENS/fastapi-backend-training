@@ -1,0 +1,326 @@
+---
+title: "14 · Pipelines"
+description: "Multi-stage processing with an orchestrator. Where the eligibility checks actually live."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** Real eligibility pipeline with isolated stages and an orchestrator.
+</Tip>
+
+## Concept
+
+Right now, the worker has a single big `if/elif` block. This won't scale — every new rule means editing one function, and every test runs all rules together.
+
+**Pipelines fix this.** Each rule is its own pure function. The orchestrator runs them, captures their results, and decides the final outcome.
+
+```
+            ┌─────────────────┐
+input ──►   │   Stage 1       │ ──► result
+            └─────────────────┘
+            ┌─────────────────┐
+            │   Stage 2       │ ──► result
+            └─────────────────┘
+            ┌─────────────────┐
+            │   Stage 3       │ ──► result
+            └─────────────────┘
+                                 ↓
+                          Orchestrator combines results
+                                 ↓
+                          eligible / ineligible
+```
+
+### Anatomy of a stage
+
+A stage is a **pure function** that:
+
+1. Takes the input data (e.g., a screening dict)
+2. Returns a structured result (`StageResult`) — pass/fail, plus reason
+3. Does **not** touch the DB
+4. Does **not** raise on rule failure (rule failure is a normal output, not an error)
+
+This separation lets you unit-test stages without a database, in microseconds.
+
+## Walkthrough
+
+### Step 1 — Stage protocol
+
+```python app/pipelines/__init__.py
+# empty
+```
+
+```python app/pipelines/eligibility/__init__.py
+"""Eligibility pipeline. Pure stage functions plus an orchestrator."""
+from .orchestrator import run_pipeline, EligibilityOutcome
+from .stages import StageResult
+
+__all__ = ["run_pipeline", "EligibilityOutcome", "StageResult"]
+```
+
+```python app/pipelines/eligibility/stages.py
+"""Eligibility-check stages. Each is a pure function — no DB, no I/O."""
+from dataclasses import dataclass
+from typing import Callable
+
+from app.models.screening import Screening
+
+
+@dataclass(frozen=True)
+class StageResult:
+    name: str
+    passed: bool
+    reason: str = ""
+
+
+# Each stage takes a Screening and returns a StageResult.
+Stage = Callable[[Screening], StageResult]
+
+
+def check_age(s: Screening) -> StageResult:
+    if 18 <= s.age <= 75:
+        return StageResult("age", True)
+    return StageResult("age", False, f"age {s.age} not in [18,75]")
+
+
+def check_diagnosis(s: Screening) -> StageResult:
+    if s.diagnosis == "Type 2 Diabetes":
+        return StageResult("diagnosis", True)
+    return StageResult("diagnosis", False, f"diagnosis must be Type 2 Diabetes (got {s.diagnosis!r})")
+
+
+def check_medications(s: Screening) -> StageResult:
+    if len(s.medications or []) >= 1:
+        return StageResult("medications", True)
+    return StageResult("medications", False, "must be on stable medication (≥1 med)")
+
+
+def check_pregnancy(s: Screening) -> StageResult:
+    if not s.is_pregnant:
+        return StageResult("pregnancy", True)
+    return StageResult("pregnancy", False, "subjects who are pregnant are excluded")
+
+
+def check_liver_disease(s: Screening) -> StageResult:
+    if not s.has_liver_disease:
+        return StageResult("liver_disease", True)
+    return StageResult("liver_disease", False, "history of liver disease excludes")
+
+
+def check_other_trial(s: Screening) -> StageResult:
+    if not s.in_other_trial:
+        return StageResult("other_trial", True)
+    return StageResult("other_trial", False, "subjects in another trial are excluded")
+
+
+# Stages run in this order. Cheap checks first; cheaper to add/remove/reorder.
+ALL_STAGES: list[Stage] = [
+    check_age,
+    check_diagnosis,
+    check_medications,
+    check_pregnancy,
+    check_liver_disease,
+    check_other_trial,
+]
+```
+
+### Step 2 — Orchestrator
+
+```python app/pipelines/eligibility/orchestrator.py
+"""Run eligibility stages, collect results, decide outcome."""
+from dataclasses import dataclass
+import asyncio
+import logging
+
+from app.models.screening import Screening
+from app.pipelines.eligibility.stages import ALL_STAGES, StageResult
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EligibilityOutcome:
+    eligible: bool
+    failed_criteria: list[str]
+    stage_results: list[StageResult]
+
+
+async def run_pipeline(
+    screening: Screening,
+    *,
+    on_stage_complete=None,  # async callback(stage_result) — used by Module 15 SSE
+) -> EligibilityOutcome:
+    """Run every stage. Returns aggregate outcome.
+
+    Cooperative: we await between stages so cancellation can land cleanly.
+    """
+    results: list[StageResult] = []
+
+    for stage in ALL_STAGES:
+        # Cooperative-cancellation point: if the task was cancelled, asyncio raises here.
+        await asyncio.sleep(0)
+
+        result = stage(screening)
+        results.append(result)
+
+        if on_stage_complete is not None:
+            await on_stage_complete(result)
+
+        logger.debug("stage %s -> %s (%s)", result.name, result.passed, result.reason)
+
+    failed = [r.name for r in results if not r.passed]
+    return EligibilityOutcome(
+        eligible=not failed,
+        failed_criteria=failed,
+        stage_results=results,
+    )
+```
+
+### Step 3 — Use the pipeline in the worker
+
+Replace the placeholder logic in `app/services/screening_service.py`:
+
+```python app/services/screening_service.py
+from app.pipelines.eligibility import run_pipeline
+
+
+async def run_eligibility_pipeline(
+    runner: BackgroundTaskRunner,
+    db_factory,
+    screening_id: UUID,
+) -> None:
+    async def _job():
+        async with db_factory() as db:
+            screening = await get_screening(db, screening_id)
+            if screening.status != "submitted":
+                return
+            await repo.update_status(db, screening, status="reviewing")
+
+            outcome = await run_pipeline(screening)
+
+            await repo.update_status(
+                db,
+                screening,
+                status="eligible" if outcome.eligible else "ineligible",
+                eligibility_result="eligible" if outcome.eligible else "ineligible",
+                failed_criteria=outcome.failed_criteria,
+            )
+
+    runner.submit(screening_id, _job)
+```
+
+The worker is now thin — it owns transitions and persistence. The pipeline owns logic.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`@dataclass(frozen=True)` for StageResult">
+    Immutable. Once created, can't be tampered with. Useful in concurrent contexts (multiple stages running in parallel later) and a clear signal "this is data, not state".
+  </Accordion>
+  <Accordion title="`await asyncio.sleep(0)` between stages — what for?">
+    A no-op yield to the event loop. Three benefits: (1) cooperative cancellation lands here cleanly (a cancelled task raises `CancelledError` at the next await). (2) Other concurrent work gets a turn. (3) Adds zero real delay.
+  </Accordion>
+  <Accordion title="`on_stage_complete` callback">
+    Hook for emitting progress events. We don't use it yet — Module 15 wires it to the SSE publisher.
+  </Accordion>
+  <Accordion title="Why a list of stages instead of one big function?">
+    **Testability** — unit-test each stage in isolation. **Auditability** — `failed_criteria=["pregnancy", "liver_disease"]` tells the user exactly which rules failed. **Modifiability** — adding a new rule means appending to the list, not editing flow.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit an eligible screening">
+    ```bash
+    curl -sX POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"AA","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["metformin"]}' | jq -r .id
+    ```
+    Within a moment, status → `eligible`. `failed_criteria` is `[]`.
+  </Step>
+  <Step title="Submit an ineligible screening">
+    ```bash
+    curl -sX POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"BB","age":17,"sex":"F","diagnosis":"Hypertension","medications":[],"is_pregnant":true,"has_liver_disease":false,"in_other_trial":false}' | jq -r .id
+    ```
+    Status → `ineligible`. Check the row:
+    ```bash
+    sqlite3 enrollment.db "SELECT failed_criteria FROM screenings WHERE id='<id>'"
+    ```
+    You'll see a JSON array: `["age","diagnosis","medications","pregnancy"]`.
+  </Step>
+  <Step title="Try enrolling the eligible one">
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/screenings/<eligible-id>/enroll | jq
+    ```
+    `subject_id` is generated.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What if a stage needs DB access (e.g., 'has this person screened before?')">
+    Two options: (1) compute it before pipeline starts and pass into the stage as input. (2) Inject a "lookup function" into the stage signature. Both keep the stage function pure (deterministic given inputs). Don't make the stage call the DB directly — that breaks testability.
+  </Accordion>
+  <Accordion title="Should stages run in parallel?">
+    Sometimes — if they're independent and slow (e.g., external API calls). Use `asyncio.gather`. Our stages are local and microsecond-fast; sequential is simpler and clearer.
+  </Accordion>
+  <Accordion title="What happens if a stage raises an exception (vs returning failed=True)?">
+    Currently, the orchestrator propagates it and the worker logs it as failure. In production you'd want a try/except per stage with a "stage_error" outcome — distinguishing rule-fail from bug-in-stage matters for ops.
+  </Accordion>
+  <Accordion title="Can I have stages in different orders for different protocols?">
+    Yes. Pass the stage list as a parameter to the orchestrator. The orchestrator becomes generic; per-protocol pipelines pick their stages.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a new stage `check_sex` with this rule (made up): the trial doesn't enroll subjects who marked sex `M` if their diagnosis is `Type 2 Diabetes`. (Pretend this is from a sub-study amendment.)
+
+    1. Add `check_sex` to `app/pipelines/eligibility/stages.py`.
+    2. Append it to `ALL_STAGES`.
+    3. Submit a screening that should fail this rule and confirm `failed_criteria` includes `"sex"`.
+
+    Stretch: write a unit test for `check_sex` that doesn't import FastAPI or the DB at all. (We'll formalize this in Module 22.)
+  </Tab>
+  <Tab title="Hint">
+    ```python
+    def check_sex(s: Screening) -> StageResult:
+        if s.sex == "M" and s.diagnosis == "Type 2 Diabetes":
+            return StageResult("sex", False, "male T2D excluded by amendment")
+        return StageResult("sex", True)
+    ```
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/14-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+SID=$(curl -sX POST http://localhost:8000/api/v1/screenings -H "Content-Type: application/json" \
+  -d '{"site_id":"SITE-001","candidate_initials":"MM","age":40,"sex":"M","diagnosis":"Type 2 Diabetes","medications":["metformin"]}' | jq -r .id)
+
+sleep 1
+curl -s http://localhost:8000/api/v1/screenings/$SID | jq '{status, failed_criteria}'
+# Expect: status="ineligible", failed_criteria=["sex"]
+```
+
+## Insight
+
+<Tip>
+  **The orchestrator never references specific stages by name.** It iterates over `ALL_STAGES`. That's the point — adding, removing, or reordering rules requires zero orchestrator changes. This is the architectural property that makes pipelines so durable: rules change all the time; orchestration logic shouldn't.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/pipelines/prediction/` is the production version — much more elaborate, with parallel per-form processing and hooks. The same pattern: stages as pure functions, orchestrator iterates.
+
+## Next module
+
+<Card title="Module 15: Real-time updates (SSE)" icon="rocket" href="/modules/15-realtime-sse">
+  Stream pipeline progress to the client. The `on_stage_complete` callback finally gets used.
+</Card>

@@ -1,0 +1,349 @@
+---
+title: "18b · Permission service pattern"
+description: "Centralize object-level authorization. One file, one source of truth, fully auditable."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~25 lines · **Outcome:** Permission decisions flow through a single service with consistent error handling and audit logging.
+</Tip>
+
+## Concept
+
+After Module 17b you have functions like:
+
+```python
+def can_access_screening(user, screening) -> bool: ...
+def can_modify_screening(user, screening) -> bool: ...
+```
+
+Then services do:
+
+```python
+if not permissions.can_access_screening(user, screening):
+    await audit.append(uow.session, ..., action="screening.access_denied", ...)
+    raise ScreeningNotFound(...)
+```
+
+That's repetitive. Six places need to do the same dance. Time to centralize.
+
+### The Permission Service pattern
+
+```python
+await permission_service.ensure_can_access_screening(uow, user, screening)
+# raises ScreeningNotFound + audits if denied; returns silently if allowed
+```
+
+One call. One place that owns the rules, the audit, and the error mapping. Routes and other services just *ask*.
+
+### Why this is a senior-level pattern
+
+<CardGroup cols={3}>
+  <Card title="Auditable" icon="book">
+    Every permission decision goes through one file. Easy to review.
+  </Card>
+  <Card title="Testable" icon="puzzle-piece">
+    Test the policies in isolation; mock the service in higher-level tests.
+  </Card>
+  <Card title="Evolvable" icon="rocket">
+    Add new resource types or rules in one place. No service-by-service refactor.
+  </Card>
+</CardGroup>
+
+## Walkthrough
+
+### Step 1 — Convert `permissions.py` into a service
+
+```python app/services/permission_service.py
+"""Centralized object-level permission service.
+
+Every object-level access check goes through here. The service:
+  1. Decides allow/deny based on policy
+  2. Records audit entries for denials
+  3. Raises a NotFound-style exception (no info leak)
+
+If a policy needs to change, this is the only file that changes.
+"""
+from uuid import UUID
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.exceptions import Forbidden, ScreeningNotFound
+from app.models.screening import Screening
+from app.models.user import User
+from app.repositories import audit_repository as audit
+
+
+# ─── Policies (pure functions) ──────────────────────────────────
+
+def _can_access_screening(user: User, screening: Screening) -> bool:
+    if user.role == "sponsor":
+        return True
+    if user.role == "coordinator" and user.site_id == screening.site_id:
+        return True
+    return False
+
+
+def _can_modify_screening(user: User, screening: Screening) -> bool:
+    if user.role == "coordinator" and user.site_id == screening.site_id:
+        return True
+    return False
+
+
+# ─── Public API: ensure_* methods raise on denial ────────────────
+
+async def ensure_can_access_screening(
+    db: AsyncSession,
+    user: User,
+    screening: Screening,
+) -> None:
+    if _can_access_screening(user, screening):
+        return
+    await audit.append(
+        db,
+        actor_id=str(user.id),
+        actor_role=user.role,
+        action="screening.access_denied",
+        resource_type="screening",
+        resource_id=str(screening.id),
+        metadata={
+            "user_site": user.site_id,
+            "screening_site": screening.site_id,
+        },
+    )
+    raise ScreeningNotFound(f"Screening {screening.id} not found")
+
+
+async def ensure_can_modify_screening(
+    db: AsyncSession,
+    user: User,
+    screening: Screening,
+    *,
+    operation: str,
+) -> None:
+    if _can_modify_screening(user, screening):
+        return
+    await audit.append(
+        db,
+        actor_id=str(user.id),
+        actor_role=user.role,
+        action="screening.modify_denied",
+        resource_type="screening",
+        resource_id=str(screening.id),
+        metadata={
+            "operation": operation,
+            "user_site": user.site_id,
+            "screening_site": screening.site_id,
+        },
+    )
+    raise Forbidden("You cannot modify this screening")
+
+
+async def ensure_can_submit_for_site(
+    db: AsyncSession,
+    user: User,
+    site_id: str,
+) -> None:
+    """Coordinators may only submit screenings for their own site."""
+    if user.role == "sponsor":
+        return  # sponsors don't submit (already blocked at route level), but allowed here
+    if user.role == "coordinator" and user.site_id == site_id:
+        return
+    await audit.append(
+        db,
+        actor_id=str(user.id),
+        actor_role=user.role,
+        action="screening.submit_denied",
+        resource_type="site",
+        resource_id=site_id,
+        metadata={"user_site": user.site_id},
+    )
+    raise Forbidden(f"Coordinators may only submit for their own site (yours: {user.site_id})")
+```
+
+### Step 2 — Refactor services to use it
+
+```python app/services/screening_service.py
+from app.services import permission_service
+
+
+async def get_screening(uow, *, screening_id: UUID, user: User) -> Screening:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        await permission_service.ensure_can_access_screening(uow.session, user, screening)
+        return screening
+
+
+async def cancel_screening(uow, *, screening_id, user):
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        await permission_service.ensure_can_access_screening(uow.session, user, screening)
+        await permission_service.ensure_can_modify_screening(
+            uow.session, user, screening, operation="cancel",
+        )
+        if screening.status != "submitted":
+            raise CannotDelete(...)
+        await repo.delete(uow.session, screening)
+
+
+async def enroll_screening(uow, *, screening_id, user):
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(...)
+        await permission_service.ensure_can_access_screening(uow.session, user, screening)
+        await permission_service.ensure_can_modify_screening(
+            uow.session, user, screening, operation="enroll",
+        )
+        # ... rest
+
+
+async def submit_screening(uow, runner, progress, *, user, payload):
+    async with uow:
+        await permission_service.ensure_can_submit_for_site(
+            uow.session, user, payload.site_id,
+        )
+        site = await site_repository.get_by_id(uow.session, payload.site_id)
+        if site is None or not site.active:
+            raise InvalidSite(...)
+        screening = await repo.create(uow.session, **payload.model_dump())
+        await audit.append(
+            uow.session,
+            actor_id=str(user.id),
+            actor_role=user.role,
+            action="screening.submitted",
+            resource_type="screening",
+            resource_id=str(screening.id),
+            metadata={"site_id": screening.site_id},
+        )
+        uow.publish_after_commit(...)
+        return screening
+```
+
+The screening service is now narrative — it reads like the rules. The permission service handles all enforcement.
+
+### Step 3 — Delete the old `permissions.py`
+
+It's superseded by `permission_service.py`. Two concrete edits to make:
+
+1. **Delete the file** `app/services/permissions.py`.
+2. **In `app/services/screening_service.py`** (and any tests that mention it), replace
+   `from app.services import permissions` with
+   `from app.services import permission_service`, and update every `permissions.can_*` call to `permission_service.ensure_*` per the new shape above.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why `ensure_*` instead of `check_*`?">
+    Naming convention. `ensure` means "raise if not satisfied" — by reading the call site you know it's a guard, not a query. `check` is ambiguous (returns bool? raises?). Use both deliberately.
+  </Accordion>
+  <Accordion title="Why pass `db` instead of using a DI dep?">
+    The permission service is called *from inside the UoW*, so reusing the open session is essential — same transaction. A DI-based session would open a new one and split the audit write from the business write. Don't.
+  </Accordion>
+  <Accordion title="Could `ensure_can_*` look up the resource itself?">
+    Yes — that's a common variant. Instead of "fetch then check", do `ensure_can_access_screening(uow.session, user, screening_id=...)` and let the service load it. Trade-off: callers can't easily share the loaded resource with later steps. We pick "fetch then check" for simplicity.
+  </Accordion>
+  <Accordion title="Where does the operation-specific message go?">
+    The `operation` parameter ("cancel", "enroll") goes into the audit metadata so denial logs have context, and into the message via the message-or-detail. Keep messages user-facing-safe; put detail in metadata.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Bob tries to enroll Alice's screening">
+    Bob auths, gets her screening ID somehow (e.g., from a redacted summary), tries:
+    ```bash
+    curl -i -H "Authorization: Bearer $BOB" -X POST \
+      http://localhost:8000/api/v1/screenings/$ALICE_SID/enroll
+    # 404 — leaks no info; audit logs the attempt
+    ```
+  </Step>
+  <Step title="Check the audit log">
+    ```bash
+    curl -H "Authorization: Bearer $ADMIN" \
+      'http://localhost:8000/api/v1/admin/audit?action=screening.access_denied&limit=5' | jq
+    ```
+    You see the denial entry — actor, target, metadata.
+  </Step>
+  <Step title="Run a permission policy in isolation">
+    The `_can_access_screening` and `_can_modify_screening` are pure functions. Open a Python REPL:
+    ```python
+    from types import SimpleNamespace
+    from app.services.permission_service import _can_access_screening
+    sponsor = SimpleNamespace(role="sponsor", site_id=None)
+    coord = SimpleNamespace(role="coordinator", site_id="SITE-001")
+    s = SimpleNamespace(site_id="SITE-002")
+    _can_access_screening(sponsor, s)  # True
+    _can_access_screening(coord, s)    # False
+    ```
+    Pure-function policies are unit-test gold (Module 22).
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Why split private (`_can_*`) from public (`ensure_*`)?">
+    The private functions are pure — easy to unit-test, no DB. The public functions wrap them with audit + raise. Tests can target either layer.
+  </Accordion>
+  <Accordion title="Should the audit row commit even when the access is allowed?">
+    No — the **business operation** writes its own audit when it succeeds (`screening.submitted`, `screening.enrolled`). Permission service only audits *denials*. Otherwise audit volume explodes 10×.
+  </Accordion>
+  <Accordion title="What if I have permissions for many resource types — does this file balloon?">
+    For 5–10 types, fine. Past that, split per resource: `permission_service/screening.py`, `permission_service/study.py`, with a common base. The architecture stays the same.
+  </Accordion>
+  <Accordion title="What about caching permission decisions?">
+    Per-request, yes — pass the `screening` object once and reuse. Across requests, no — permissions can change (role changes, site moves). Per-request reuse is enough.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add **`ensure_can_view_audit_log(user)`** to the permission service.
+
+    Rule: only `sponsor` role can view the audit log. (Even with the strict-mode RBAC at the router, having this in the service means a CLI tool calling the same service is also protected.)
+
+    Use it in the admin route `/audit`:
+
+    ```python
+    @router.get("/audit")
+    async def list_audit(
+        ...,
+        user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session),
+    ):
+        await permission_service.ensure_can_view_audit_log(db, user)
+        return await audit.list_filtered(db, ...)
+    ```
+
+    Verify: as Alice (coordinator), the route returns 403 with audit entry `audit.view_denied`.
+  </Tab>
+  <Tab title="Hint">
+    Same shape as `ensure_can_submit_for_site`. Audit on denial. Raise `Forbidden(...)`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/18b-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The Permission Service is the single auditable surface for "who can do what".** Six months in, when a regulator asks "show me how access decisions work in this system", you point at this one file. Every rule, every audit event, every denial path is there. That's the production-grade payoff of centralization.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub doesn't have a centralized permission service — checks are inline in routes via `require_role`. As the codebase grew, the lack of centralization made it harder to audit who can do what. This module is the upgrade path.
+
+## Next module
+
+<Card title="Module 19: Rate limiting & caching" icon="server" href="/modules/19-rate-limit-cache">
+  Protect the API from abuse. Cache hot reads.
+</Card>

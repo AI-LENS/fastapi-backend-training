@@ -1,0 +1,109 @@
+---
+title: "19 · Solution"
+description: "Screening cache with invalidation."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/cache/screenings.py
+from uuid import UUID
+
+from cachetools import TTLCache
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.screening import Screening
+from app.repositories import screening_repository
+
+_cache: TTLCache = TTLCache(maxsize=10_000, ttl=5)
+
+
+async def get_screening_cached(db: AsyncSession, screening_id: UUID) -> Screening | None:
+    cached = _cache.get(screening_id)
+    if cached is not None:
+        return cached
+    screening = await screening_repository.get_by_id(db, screening_id)
+    if screening is not None:
+        _cache[screening_id] = screening
+    return screening
+
+
+def invalidate_screening(screening_id: UUID) -> None:
+    _cache.pop(screening_id, None)
+```
+
+```python app/repositories/screening_repository.py
+from app.cache import screenings as screening_cache
+
+
+async def update_status(db, screening, *, status, eligibility_result=None, failed_criteria=None):
+    screening.status = status
+    if eligibility_result is not None:
+        screening.eligibility_result = eligibility_result
+    if failed_criteria is not None:
+        screening.failed_criteria = failed_criteria
+    await db.flush()
+    screening_cache.invalidate_screening(screening.id)
+    return screening
+
+
+async def mark_enrolled(db, screening, *, subject_id):
+    screening.status = "enrolled"
+    screening.subject_id = subject_id
+    screening.enrolled_at = datetime.now(timezone.utc)
+    await db.flush()
+    screening_cache.invalidate_screening(screening.id)
+    return screening
+
+
+async def delete(db, screening):
+    await db.delete(screening)
+    await db.flush()
+    screening_cache.invalidate_screening(screening.id)
+```
+
+```python app/services/screening_service.py
+from app.cache import screenings as screening_cache
+
+
+async def get_screening(uow, *, screening_id, user):
+    async with uow:
+        screening = await screening_cache.get_screening_cached(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(...)
+        await permission_service.ensure_can_access_screening(uow.session, user, screening)
+        return screening
+```
+
+## Verify cache invalidation
+
+```bash
+SID=$(curl -sX POST .../screenings -d '...' -H "Authorization: Bearer $ALICE" | jq -r .id)
+
+# Read 1 — populates cache
+curl -H "Authorization: Bearer $ALICE" http://localhost:8000/api/v1/screenings/$SID | jq .status
+# Read 2 — should hit cache, same status
+curl -H "Authorization: Bearer $ALICE" http://localhost:8000/api/v1/screenings/$SID | jq .status
+
+# Update directly to trigger invalidation:
+sqlite3 enrollment.db "UPDATE screenings SET status='something_weird' WHERE id='$SID'"
+# (this bypasses our app, so cache won't invalidate — demonstrates why we always go through repo)
+
+# Now hit a service path that goes through the repo (e.g., enroll), and observe cache update
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why pop on flush, not commit?">
+    If we pop on commit, a transaction that gets rolled back leaves the cache untouched (correct). But if we read in the same transaction after a flush, we'd hit stale cache. Popping on flush is conservative — the cache is briefly out of sync if the transaction rolls back, but the next read repopulates from DB.
+  </Accordion>
+  <Accordion title="What about concurrent writes from another worker?">
+    With multiple workers, this in-memory cache is broken — each worker has its own copy. Use Redis (with pub/sub for invalidation) once you scale.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 20: Structured logging" icon="book" href="/modules/20-logging" />

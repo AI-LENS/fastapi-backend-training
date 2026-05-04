@@ -1,0 +1,44 @@
+---
+title: "11 · Solution"
+description: "First-class SiteNotFound."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/routers/sites.py
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.dependencies import get_db_session
+from app.exceptions import SiteNotFound
+from app.repositories import site_repository as repo
+from app.schemas.site import SiteResponse
+
+router = APIRouter(prefix="/sites", tags=["sites"])
+
+
+@router.get("", response_model=list[SiteResponse])
+async def list_sites(active: bool | None = None, db: AsyncSession = Depends(get_db_session)):
+    return await repo.list_all(db, active=active)
+
+
+@router.get("/{site_id}", response_model=SiteResponse)
+async def get_site(site_id: str, db: AsyncSession = Depends(get_db_session)):
+    site = await repo.get_by_id(db, site_id)
+    if site is None:
+        raise SiteNotFound(
+            f"Site {site_id} not found",
+            details={"site_id": site_id},
+        )
+    return site
+```
+
+## Why move it from router to service?
+
+You could also push the not-found check into a `site_service.get_site()` function. For sites we don't currently have any business logic, so a direct repo call from the router is fine. The principle: **add a service when you have decisions to make.** Anemic services exist purely to wrap repos and add no value.
+
+## Next
+
+<Card title="Module 12: Async/await" icon="rocket" href="/modules/12-async-await" />

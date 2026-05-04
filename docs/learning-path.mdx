@@ -1,0 +1,150 @@
+---
+title: "Learning Path"
+description: "All 36 modules at a glance, grouped into 9 parts. Production-grade by design."
+---
+
+The full curriculum. Each module is one focused concept with a hands-on exercise.
+
+<Note>
+  **Time estimate per module:** 30–60 min for read + walkthrough + exercise. Total ≈ 30 hours.
+</Note>
+
+<Tip>
+  Modules with a letter suffix (e.g. `10b`, `17b`) are **production-grade additions** — patterns that separate "code that works" from "code you can run for real". They're not optional.
+</Tip>
+
+## Part A — Foundations
+
+| # | Module | Concept |
+|---|---|---|
+| 01 | [Hello FastAPI](/modules/01-hello-fastapi) | App, route handler, ASGI, OpenAPI, `/docs` |
+| 02 | [Pydantic schemas](/modules/02-pydantic-schemas) | Request/response models, validation, types, enums |
+| 03 | [Routers & params](/modules/03-routers) | `APIRouter`, path/query/body, status codes, `response_model` |
+| 04 | [Project structure](/modules/04-project-structure) | Folder layout, app factory, lifespan, settings |
+
+## Part B — Data layer
+
+| # | Module | Concept |
+|---|---|---|
+| 05 | [SQLAlchemy](/modules/05-sqlalchemy) | Engine, sessions, sync vs async |
+| 06 | [Models](/modules/06-models) | Tables, relationships, indexes, timestamps |
+| 07 | [Migrations](/modules/07-migrations) | Alembic init, autogenerate, upgrade, downgrade |
+| 08 | [Repository pattern](/modules/08-repository-pattern) | DB access isolated, testable |
+
+## Part C — Business logic
+
+| # | Module | Concept |
+|---|---|---|
+| 09 | [Service layer](/modules/09-service-layer) | Business rules, decisions |
+| 10 | [Dependency injection](/modules/10-dependency-injection) | `Depends()`, sub-deps, scopes |
+| **10b** | **[Unit of Work & transactions](/modules/10b-unit-of-work)** | **Explicit transaction boundaries; outbox preview** |
+| 11 | [Custom exceptions](/modules/11-exceptions) | Domain errors, handlers, error envelopes |
+
+## Part D — Async & background
+
+| # | Module | Concept |
+|---|---|---|
+| 12 | [Async/await](/modules/12-async-await) | `def` vs `async def`, blocking calls |
+| 13 | [Workers (basic)](/modules/13-workers) | `BackgroundTasks`, `asyncio` tasks, thread pools |
+| **13b** | **[Production worker semantics](/modules/13b-worker-semantics)** | **Retries, backoff, DLQ, idempotency, timeouts** |
+| 14 | [Pipelines](/modules/14-pipelines) | Multi-stage processing, orchestrator |
+| 15 | [Real-time updates](/modules/15-realtime-sse) | Server-Sent Events |
+
+## Part E — Security & cross-cutting
+
+| # | Module | Concept |
+|---|---|---|
+| 16 | [JWT auth](/modules/16-jwt-auth) | Login, password hashing, token issue |
+| 17 | [RBAC](/modules/17-rbac) | Roles, route guards |
+| **17b** | **[Object-level authorization](/modules/17b-object-level-auth)** | **OWASP API #1 — per-object access control** |
+| **17c** | **[Audit logs](/modules/17c-audit-logs)** | **Tamper-evident, append-only event trail** |
+| 18 | [Middleware](/modules/18-middleware) | CORS, request IDs, request logging |
+| **18b** | **[Permission service pattern](/modules/18b-permission-service)** | **Centralized authorization decisions** |
+| 19 | [Rate limit & cache](/modules/19-rate-limit-cache) | slowapi, Redis cache |
+
+## Part F — Observability
+
+| # | Module | Concept |
+|---|---|---|
+| 20 | [Structured logging](/modules/20-logging) | JSON logs, correlation IDs |
+| 21 | [Metrics & tracing](/modules/21-metrics-tracing) | Prometheus, OpenTelemetry |
+
+## Part G — Testing
+
+| # | Module | Concept |
+|---|---|---|
+| 22 | [Unit tests](/modules/22-unit-tests) | pytest, services + repos, fakes vs mocks |
+| **22b** | **[Contract, load & security tests](/modules/22b-contract-load-security-tests)** | **Schemathesis, Locust, OWASP ZAP** |
+| 23 | [Integration tests](/modules/23-integration-tests) | TestClient, dep overrides, test DB |
+
+## Part H — Production
+
+| # | Module | Concept |
+|---|---|---|
+| 24 | [Config & secrets](/modules/24-config-secrets) | 12-factor, env layering |
+| 25 | [Docker](/modules/25-docker) | Dockerfile, docker-compose with Postgres |
+| 26 | [Deployment](/modules/26-deployment) | Uvicorn workers, health probes, graceful shutdown |
+| **26b** | **[CI/CD](/modules/26b-cicd)** | **Test → build → migrate → deploy pipeline** |
+| **26c** | **[Monitoring & alerting](/modules/26c-monitoring-alerting)** | **Alerts on golden signals; runbooks** |
+
+## Part I — Advanced
+
+| # | Module | Concept |
+|---|---|---|
+| 27 | [Pagination & idempotency](/modules/27-pagination-idempotency) | Cursor pagination, idempotency keys |
+| 28 | [Task queues at scale](/modules/28-task-queues) | Celery/Arq overview, retry/DLQ, **outbox pattern** |
+
+## Conventions in every module
+
+<CardGroup cols={2}>
+  <Card title="Concept" icon="book">
+    Opens with *what* and *why*. Skim once; re-read after the exercise.
+  </Card>
+  <Card title="Walkthrough" icon="code">
+    The code we add. Type it, don't paste.
+  </Card>
+  <Card title="Exercise" icon="puzzle-piece">
+    Yours alone. Don't peek at the solution until done.
+  </Card>
+  <Card title="Verify" icon="terminal">
+    Exact commands and expected output.
+  </Card>
+</CardGroup>
+
+## Production-grade checklist coverage
+
+This curriculum addresses the full production checklist:
+
+| Concern | Module |
+|---|---|
+| Layering (router/service/repo/worker/pipeline) | 03, 08, 09, 13, 14 |
+| Transactions / Unit of Work | **10b** |
+| Authentication | 16 |
+| RBAC | 17 |
+| **Object-level authorization (OWASP API #1)** | **17b** |
+| **Audit logs** | **17c** |
+| **Permission service** | **18b** |
+| Migrations | 07 |
+| Idempotency | 27 |
+| **Worker semantics (retries, DLQ, backoff)** | **13b** |
+| **Outbox pattern** | **28** |
+| Structured logging + correlation IDs | 20 |
+| Metrics + distributed tracing | 21 |
+| Health / readiness / startup probes | 26 |
+| Rate limiting | 19 |
+| Caching | 19 |
+| Config + secrets | 04, 24 |
+| API versioning | 04 |
+| Error envelopes | 11 |
+| Unit + integration tests | 22, 23 |
+| **Contract + load + security tests** | **22b** |
+| Docker | 25 |
+| **CI/CD** | **26b** |
+| **Monitoring & alerting** | **26c** |
+| Graceful shutdown | 26 |
+
+## Where to start
+
+<Card title="Module 01: Hello FastAPI" icon="rocket" href="/modules/01-hello-fastapi">
+  Begin here. 30 minutes.
+</Card>

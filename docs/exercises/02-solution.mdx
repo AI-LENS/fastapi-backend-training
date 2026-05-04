@@ -1,0 +1,94 @@
+---
+title: "02 · Solution"
+description: "Add Site schemas and endpoints."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Files
+
+```python app/schemas/site.py
+"""Pydantic schemas for the Site resource."""
+from pydantic import BaseModel
+
+
+class SiteResponse(BaseModel):
+    id: str
+    name: str
+    active: bool
+
+    model_config = {"from_attributes": True}
+```
+
+```python app/main.py {3-4, 25-44}
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from fastapi import FastAPI
+
+from app.schemas.screening import ScreeningCreate, ScreeningResponse
+from app.schemas.site import SiteResponse
+
+app = FastAPI(title="Subject Enrollment Service", version="0.2.0")
+
+_screenings: dict[UUID, dict] = {}
+
+# Hardcoded sites (Module 06 moves to a real DB table)
+_SITES: list[SiteResponse] = [
+    SiteResponse(id="SITE-001", name="Mass General", active=True),
+    SiteResponse(id="SITE-002", name="Stanford Health", active=True),
+    SiteResponse(id="SITE-003", name="Old Site", active=False),
+]
+
+
+@app.get("/")
+def root():
+    return {"service": "Subject Enrollment Service", "status": "ok"}
+
+
+@app.get("/sites", response_model=list[SiteResponse])
+def list_sites():
+    return _SITES
+
+
+@app.get("/sites/{site_id}", response_model=SiteResponse)
+def get_site(site_id: str):
+    for site in _SITES:
+        if site.id == site_id:
+            return site
+    # Module 11 replaces this with a proper exception
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail=f"Site {site_id} not found")
+
+
+@app.post("/screenings", response_model=ScreeningResponse, status_code=201)
+def create_screening(payload: ScreeningCreate):
+    screening = {
+        "id": uuid4(),
+        "status": "submitted",
+        "created_at": datetime.utcnow(),
+        **payload.model_dump(),
+    }
+    _screenings[screening["id"]] = screening
+    return screening
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why a `list[SiteResponse]` response model?">
+    You can declare collections of schemas. FastAPI generates a JSON array in the OpenAPI spec and validates each item.
+  </Accordion>
+  <Accordion title="Why `HTTPException` here, not a custom exception?">
+    Quick fix. Module 11 introduces `SiteNotFound` and an exception handler — you'll refactor this then.
+  </Accordion>
+  <Accordion title="Why store as `SiteResponse` instances?">
+    They're already typed and ready to return. If we stored dicts, FastAPI would still serialize them via `from_attributes`, but using the model directly catches typos at startup.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 03: Routers & params" icon="puzzle-piece" href="/modules/03-routers">
+  Time to split this growing `main.py` into focused router files.
+</Card>

@@ -1,0 +1,246 @@
+---
+title: "01 · Hello FastAPI"
+description: "Your first FastAPI app. App object, route handler, ASGI, auto-generated OpenAPI docs."
+---
+
+<Tip>
+  **Time:** 30 min · **Code you'll write:** ~8 lines · **Outcome:** A running API with two endpoints and interactive docs.
+</Tip>
+
+## Concept
+
+FastAPI is a **Python web framework** for building APIs. Three things matter on day one:
+
+<CardGroup cols={3}>
+  <Card title="The app object" icon="server">
+    A single `FastAPI()` instance is your application. Routes attach to it.
+  </Card>
+  <Card title="Route handlers" icon="code">
+    Python functions decorated with `@app.get(...)` etc. — they handle HTTP requests.
+  </Card>
+  <Card title="Auto-generated docs" icon="book">
+    FastAPI reads your function signatures and generates Swagger UI for free at `/docs`.
+  </Card>
+</CardGroup>
+
+### Why FastAPI (vs Flask, Django, etc.)
+
+- **Type-driven** — your function's type hints become the API contract
+- **Async-native** — `async def` is first-class, not bolted on
+- **OpenAPI built in** — Swagger UI and ReDoc come free
+- **Pydantic for validation** — request bodies validate themselves (Module 02)
+
+### What's an "ASGI" app?
+
+You'll see this term. WSGI is the old Python web standard (synchronous, one request at a time per worker). **ASGI** is the modern async-friendly version. FastAPI is an ASGI app, and `uvicorn` is the ASGI server that runs it.
+
+```
+HTTP request → Uvicorn (ASGI server) → FastAPI app → your function → response
+```
+
+## Walkthrough
+
+We're starting with the simplest possible app: one endpoint, no database, no schemas. Just enough to see the request/response loop work.
+
+Open `app/main.py`:
+
+```python app/main.py
+"""Subject Enrollment Service — entry point."""
+from fastapi import FastAPI
+
+app = FastAPI(
+    title="Subject Enrollment Service",
+    description="Clinical trial enrollment training app",
+    version="0.1.0",
+)
+
+
+@app.get("/")
+def root():
+    """Service banner — also acts as a basic liveness check."""
+    return {
+        "service": "Subject Enrollment Service",
+        "version": "0.1.0",
+        "status": "ok",
+    }
+```
+
+### Line by line
+
+<AccordionGroup>
+  <Accordion title="`from fastapi import FastAPI`">
+    Imports the framework's main class. Everything starts from `FastAPI`.
+  </Accordion>
+  <Accordion title="`app = FastAPI(title=..., description=..., version=...)`">
+    Creates *the* app object. `title`/`description`/`version` show up in the auto-generated `/docs`. They're also part of the OpenAPI spec other tools (Postman, code generators) use.
+  </Accordion>
+  <Accordion title="The @app.get(...) decorator">
+    A **decorator** that registers the next function as the handler for `GET /`. Other verbs: `@app.post`, `@app.put`, `@app.delete`, `@app.patch`.
+  </Accordion>
+  <Accordion title="`def root():`">
+    The handler function. The name doesn't matter for routing — the decorator does the routing. Convention: name it after what it does.
+  </Accordion>
+  <Accordion title="`return { ... }`">
+    Return a dict. FastAPI converts it to JSON automatically and sets `Content-Type: application/json`. (Later we'll return Pydantic models for proper schemas.)
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Sync dependencies">
+    ```bash
+    uv sync
+    ```
+    Reads `pyproject.toml` and installs into a managed `.venv` — no activation needed.
+  </Step>
+  <Step title="Start the server">
+    ```bash
+    uv run uvicorn app.main:app --reload --port 8000
+    ```
+    `uv run` runs the command inside the project's venv automatically. The path `app.main:app` means *"in the file `app/main.py`, find the variable named `app`"*.
+  </Step>
+  <Step title="Hit the root endpoint">
+    In another terminal:
+    ```bash
+    curl http://localhost:8000/
+    ```
+    You should see your JSON banner.
+  </Step>
+  <Step title="Open the auto-generated docs">
+    Browser → [http://localhost:8000/docs](http://localhost:8000/docs)
+
+    You'll see Swagger UI with one endpoint listed. Click it, click **Try it out**, click **Execute**. The response shows up live.
+  </Step>
+  <Step title="Look at ReDoc too">
+    [http://localhost:8000/redoc](http://localhost:8000/redoc) — the same OpenAPI spec, rendered differently. Some teams prefer this for read-only API documentation.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="If I rename the function from `root` to `home`, will the URL change?">
+    **No.** The URL is determined by the decorator argument (`@app.get("/")`), not the function name. You could call it `pneumonoultramicroscopicsilicovolcanoconiosis` and the route would still be `/`.
+  </Accordion>
+  <Accordion title="What happens if I write `@app.post('/')` instead of `@app.get('/')`?">
+    `GET /` would return a 405 *Method Not Allowed*. `POST /` would work but you can't easily test it from a browser address bar — you'd need `curl -X POST` or Swagger UI.
+  </Accordion>
+  <Accordion title="Why do I need `--reload` when running uvicorn?">
+    Without it, Uvicorn loads `main.py` once and ignores edits. With `--reload`, the server watches files and restarts on save. Use it in development; **never** in production (it's expensive and not safe under load).
+  </Accordion>
+  <Accordion title="Where does `/docs` come from? I didn't write it.">
+    FastAPI ships with two built-in routes: `/docs` (Swagger UI) and `/redoc` (ReDoc). Both render the OpenAPI schema FastAPI generates from your code at `/openapi.json`. You can disable them in production by passing `docs_url=None, redoc_url=None` to `FastAPI()`.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a second endpoint to `app/main.py`:
+
+    ```
+    GET /sites/{site_id}
+    ```
+
+    It should accept a `site_id` from the URL path and return a dict like:
+
+    ```json
+    {
+      "site_id": "SITE-001",
+      "name": "Example Hospital",
+      "active": true
+    }
+    ```
+
+    Use a hard-coded `name` for now — we'll wire up real data in later modules.
+
+    **Constraints:**
+    - Must use a path parameter (`{site_id}` in the route)
+    - The handler function should be type-annotated (`site_id: str`)
+    - The dict you return must echo the `site_id` you received
+
+    You'll write **about 6 lines of code**.
+  </Tab>
+  <Tab title="Hint 1">
+    A path parameter is declared by putting `{name}` in the route string and a matching argument in the function:
+
+    ```python
+    @app.get("/items/{item_id}")
+    def get_item(item_id: str):
+        return {"item_id": item_id}
+    ```
+
+    Adapt this pattern to `/sites/{site_id}`.
+  </Tab>
+  <Tab title="Hint 2">
+    Your function signature should be:
+
+    ```python
+    def get_site(site_id: str):
+        ...
+    ```
+
+    Inside, return a dict with three keys: `site_id`, `name`, `active`. The first echoes the parameter; the other two are hard-coded.
+  </Tab>
+  <Tab title="Solution">
+    Don't peek until you've tried.
+
+    [Reveal solution →](/exercises/01-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+
+After you save your changes (Uvicorn should auto-reload), run these and confirm the output:
+
+<Steps>
+  <Step title="Test with curl">
+    ```bash
+    curl http://localhost:8000/sites/SITE-001
+    ```
+
+    Expected output (formatting may differ):
+    ```json
+    {"site_id":"SITE-001","name":"Example Hospital","active":true}
+    ```
+  </Step>
+  <Step title="Try a different ID">
+    ```bash
+    curl http://localhost:8000/sites/SITE-042
+    ```
+
+    The `site_id` field in the response should change to `"SITE-042"`. The other fields stay the same (we hard-coded them).
+  </Step>
+  <Step title="Check the auto-docs">
+    Refresh [http://localhost:8000/docs](http://localhost:8000/docs). You should now see **two** endpoints. The new one shows the `site_id` parameter is required and is a string.
+  </Step>
+</Steps>
+
+## Insight
+
+<Tip>
+  **The OpenAPI spec was generated from your type hints.** Notice how `/docs` knew that `site_id` is a string and required — because you wrote `site_id: str` in the function signature. This is the foundation of FastAPI: types → contract → docs → validation. We'll lean on this hard in Module 02.
+</Tip>
+
+## Real-world reference
+
+In the production AnnotateHub API, the equivalent of `app/main.py` is:
+
+```
+/Users/chaitanyapradeeprepaka/Desktop/Final CRF Annotation/annotate-hub-api/app/main.py
+```
+
+It's longer because it adds CORS, lifespan, routers, etc. — but the core `app = FastAPI(...)` pattern is identical. By Module 04 your `main.py` will look very similar.
+
+## What's next
+
+<CardGroup cols={2}>
+  <Card title="Module 02: Pydantic schemas" icon="puzzle-piece" href="/modules/02-pydantic-schemas">
+    Replace bare dicts with validated request and response models.
+  </Card>
+  <Card title="Exercise solution" icon="check" href="/exercises/01-solution">
+    Compare your code with mine after you finish.
+  </Card>
+</CardGroup>

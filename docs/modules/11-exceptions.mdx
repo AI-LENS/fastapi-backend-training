@@ -1,0 +1,305 @@
+---
+title: "11 · Custom exceptions"
+description: "Domain exceptions, exception handlers, error envelopes, status code mapping."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~15 lines · **Outcome:** Routes stop translating errors. One handler maps every domain exception to the right HTTP response.
+</Tip>
+
+## Concept
+
+Look at your routes after Module 09:
+
+```python
+try:
+    return await service.enroll_screening(db, id)
+except service.ScreeningNotFound: ...
+except service.AlreadyEnrolled: ...
+except service.IneligibleScreening: ...
+```
+
+Six try/except chains across the file, all doing the same translation. Repetition is a smell.
+
+**Solution:** map each exception class to an HTTP status, register handlers once, throw away the try/except chains.
+
+### What a good exception layer gives you
+
+<CardGroup cols={3}>
+  <Card title="Consistent errors" icon="shield">
+    Every error response has the same shape — easier for clients.
+  </Card>
+  <Card title="Clean routes" icon="code">
+    Routes call the service and return; no error-mapping noise.
+  </Card>
+  <Card title="Centralized logging" icon="chart-bar">
+    One handler logs every domain error with the same format.
+  </Card>
+</CardGroup>
+
+### The error envelope
+
+A consistent JSON shape for all errors:
+
+```json
+{
+  "error": {
+    "code": "screening_not_found",
+    "message": "Screening 7f3a... not found",
+    "details": { "screening_id": "7f3a..." }
+  }
+}
+```
+
+This is what the client parses. Better than raw `{"detail": "..."}` because:
+- Clients can switch on `error.code`
+- `details` carries structured data
+- Forward-compatible (new fields won't break parsers)
+
+## Walkthrough
+
+### Step 1 — Centralize the exception classes
+
+Move them from `screening_service.py` into a dedicated module:
+
+```python app/exceptions.py
+"""Domain exceptions used across the application.
+
+Routes never catch these — the global handler in `main.py` translates them
+to consistent HTTP responses.
+"""
+from typing import Any
+
+
+class DomainError(Exception):
+    """Base class for all domain exceptions.
+
+    Subclasses set `code` and `status_code` and may override `details`.
+    """
+    code: str = "domain_error"
+    status_code: int = 500
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.message = message
+        self.details = details or {}
+
+
+class NotFoundError(DomainError):
+    code = "not_found"
+    status_code = 404
+
+
+class ConflictError(DomainError):
+    code = "conflict"
+    status_code = 409
+
+
+class ValidationError(DomainError):
+    code = "validation_failed"
+    status_code = 422
+
+
+# ─── Concrete exceptions ─────────────────────────────────────
+
+class ScreeningNotFound(NotFoundError):
+    code = "screening_not_found"
+
+
+class SiteNotFound(NotFoundError):
+    code = "site_not_found"
+
+
+class InvalidSite(ValidationError):
+    code = "invalid_site"
+
+
+class IneligibleScreening(ValidationError):
+    code = "ineligible_screening"
+
+
+class CannotDelete(ConflictError):
+    code = "cannot_delete"
+
+
+class AlreadyEnrolled(ConflictError):
+    code = "already_enrolled"
+
+
+class AlreadyDecided(ConflictError):
+    code = "already_decided"
+```
+
+### Step 2 — Register a global handler
+
+```python app/main.py
+import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from app.exceptions import DomainError
+
+logger = logging.getLogger(__name__)
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    @app.exception_handler(DomainError)
+    async def handle_domain_error(request: Request, exc: DomainError):
+        logger.info(
+            "DomainError on %s %s: %s (code=%s)",
+            request.method, request.url.path, exc.message, exc.code,
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                }
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request: Request, exc: Exception):
+        logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"code": "internal_error", "message": "Internal server error"}},
+        )
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(...)
+    register_exception_handlers(app)
+    # ... rest
+    return app
+```
+
+### Step 3 — Update the service to use the new exception classes
+
+```python app/services/screening_service.py
+# DELETE the local exception classes (ServiceError, ScreeningNotFound, etc.)
+from app.exceptions import (
+    AlreadyDecided, AlreadyEnrolled, CannotDelete,
+    IneligibleScreening, InvalidSite, ScreeningNotFound,
+)
+
+# in `submit_screening`:
+if site is None or not site.active:
+    raise InvalidSite(
+        f"Site {payload.site_id} is unknown or inactive",
+        details={"site_id": payload.site_id},
+    )
+```
+
+### Step 4 — Strip the try/except from routes
+
+```python app/routers/screenings.py
+@router.post("/{screening_id}/enroll", response_model=ScreeningResponse)
+async def enroll(screening_id: UUID, db: AsyncSession = Depends(get_db_session)):
+    return await service.enroll_screening(db, screening_id)
+```
+
+That's it. Three lines. The handler does the rest.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`@app.exception_handler(DomainError)` covers subclasses too">
+    Yes. The handler runs for `DomainError` and any subclass — `ScreeningNotFound`, `AlreadyEnrolled`, etc. Single handler, all domain exceptions.
+  </Accordion>
+  <Accordion title="Why the `Exception` handler too?">
+    Catches anything we forgot to handle. Without it, unhandled exceptions return FastAPI's default 500 with a generic message and a stack trace in logs. With it, you log with `logger.exception()` (gets the traceback) AND return a clean JSON error envelope.
+  </Accordion>
+  <Accordion title="`logger.exception(...)` vs `logger.error(...)`">
+    `exception()` automatically attaches the current traceback to the log entry. **Always use `exception()` inside an `except` block.** `error()` is for "something is wrong" without a stack trace.
+  </Accordion>
+  <Accordion title="`details` — what goes in it?">
+    Structured context the client might need: the resource ID, the offending field, the failed criteria. Not the message (that's separate). Not stack traces or internal info (those go to logs).
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Force a not-found">
+    ```bash
+    curl -i http://localhost:8000/api/v1/screenings/00000000-0000-0000-0000-000000000000
+    ```
+    Response body:
+    ```json
+    {
+      "error": {
+        "code": "screening_not_found",
+        "message": "Screening 00000000-... not found",
+        "details": {}
+      }
+    }
+    ```
+  </Step>
+  <Step title="Force a conflict">
+    Try to delete a screening already in `enrolled` state. You should get 409 with `code: "cannot_delete"`.
+  </Step>
+  <Step title="Force a validation error">
+    Submit with bad `site_id`. 422 with `code: "invalid_site"`, plus `details.site_id` echoing the bad value.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I match Pydantic's 422 error shape, or my custom envelope?">
+    They'll differ — Pydantic's body-validation 422s have their own shape (`detail` is a list of error dicts). Module 18 covers normalizing them too if you care. For now, custom envelope for domain errors, Pydantic's default for body shape errors. Both clear.
+  </Accordion>
+  <Accordion title="Why have `code` if the status code already tells you what kind of error?">
+    Status codes are coarse. `409` could be "already enrolled" or "screening locked" or "version conflict". The `code` lets clients branch precisely without parsing the message string (which is for humans).
+  </Accordion>
+  <Accordion title="What if I want different log levels per exception type?">
+    Override per-class: `@app.exception_handler(MyClass)`. Multiple handlers can coexist; the most specific one wins.
+  </Accordion>
+  <Accordion title="Can the handler do other side effects — metrics, notifications?">
+    Yes, and that's the typical pattern. Module 21 wires Prometheus counters into this same handler so every domain error increments a metric.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Make `SiteNotFound` first-class.
+
+    1. Replace `HTTPException(404, ...)` in `app/routers/sites.py` with `SiteNotFound(...)` from `app.exceptions`.
+    2. Confirm the JSON envelope is consistent with `ScreeningNotFound`'s shape.
+    3. Add `details={"site_id": site_id}` to the exception so clients have structured context.
+  </Tab>
+  <Tab title="Hint">
+    Same pattern as the other domain exceptions. `raise SiteNotFound(f"Site {site_id} not found", details={"site_id": site_id})`. Remove the import of `HTTPException` if it's no longer used.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/11-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+curl -i http://localhost:8000/api/v1/sites/BOGUS
+# 404 with envelope:
+# { "error": { "code": "site_not_found", "message": "...", "details": { "site_id": "BOGUS" } } }
+```
+
+## Insight
+
+<Tip>
+  **The exception layer is where domain language meets API responses.** Once it's in place, you'll find yourself raising `IneligibleScreening` in deeper code without thinking about HTTP — and that's exactly the point. The same service can be called from a route, a worker, or a CLI; only the route cares that it becomes a 422.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub raises `HTTPException` directly throughout — a simpler approach that works for smaller codebases but couples deep service code to HTTP. The pattern in this module is what you'd refactor to as the codebase grows.
+
+## Next module
+
+<Card title="Module 12: Async/await" icon="rocket" href="/modules/12-async-await">
+  Time to make sure you really understand `async def`. Common pitfalls and the event-loop model.
+</Card>

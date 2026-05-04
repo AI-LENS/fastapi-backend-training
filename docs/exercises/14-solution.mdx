@@ -1,0 +1,84 @@
+---
+title: "14 · Solution"
+description: "Add the check_sex stage."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/pipelines/eligibility/stages.py
+def check_sex(s: Screening) -> StageResult:
+    """Sub-study amendment: male subjects with T2D are excluded."""
+    if s.sex == "M" and s.diagnosis == "Type 2 Diabetes":
+        return StageResult("sex", False, "male T2D excluded per amendment")
+    return StageResult("sex", True)
+
+
+ALL_STAGES: list[Stage] = [
+    check_age,
+    check_diagnosis,
+    check_medications,
+    check_pregnancy,
+    check_liver_disease,
+    check_other_trial,
+    check_sex,   # ← new
+]
+```
+
+## Bonus: a unit test
+
+Save as `tests/test_check_sex.py`:
+
+```python tests/test_check_sex.py
+"""No fixtures, no DB, no FastAPI. Just function tests."""
+from types import SimpleNamespace
+
+from app.pipelines.eligibility.stages import check_sex
+
+
+def _screening(**fields):
+    """Tiny ad-hoc factory — Module 22 introduces real factory_boy fixtures."""
+    return SimpleNamespace(**fields)
+
+
+def test_male_t2d_fails():
+    s = _screening(sex="M", diagnosis="Type 2 Diabetes")
+    result = check_sex(s)
+    assert result.passed is False
+    assert "amendment" in result.reason
+
+
+def test_female_t2d_passes():
+    s = _screening(sex="F", diagnosis="Type 2 Diabetes")
+    assert check_sex(s).passed is True
+
+
+def test_male_other_diagnosis_passes():
+    s = _screening(sex="M", diagnosis="Hypertension")
+    assert check_sex(s).passed is True
+```
+
+Run with:
+
+```bash
+uv add pytest
+uv run pytest tests/test_check_sex.py -v
+```
+
+Three tests pass in milliseconds. No FastAPI, no DB, no app startup.
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why does `SimpleNamespace` work as a fake Screening?">
+    The stage only uses attribute access (`s.sex`, `s.diagnosis`). `SimpleNamespace` provides exactly that. The stage doesn't care it's not a real ORM object — duck typing pays off.
+  </Accordion>
+  <Accordion title="Why is this so much faster to test than route tests?">
+    Pure functions: in → out. No app to start, no DB to query, no async to await. This is the *whole reason* we extracted stages.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 15: Real-time updates" icon="rocket" href="/modules/15-realtime-sse" />

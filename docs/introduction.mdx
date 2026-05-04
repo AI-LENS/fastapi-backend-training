@@ -1,0 +1,88 @@
+---
+title: "Introduction"
+description: "Learn production FastAPI architecture by building a clinical trial Subject Enrollment Service, one concept at a time."
+---
+
+Welcome. By the end of this training you can read **any** production FastAPI codebase, locate every layer, and add a feature end-to-end.
+
+We learn by building one thing: a **Subject Enrollment Service** for a clinical trial. Real shape. Simple domain. No heroic medical knowledge required.
+
+## What you'll build
+
+<CardGroup cols={2}>
+  <Card title="A clean layered API" icon="server">
+    Routers → Services → Repositories → Database, just like real production codebases.
+  </Card>
+  <Card title="A background pipeline" icon="gear">
+    Multi-stage eligibility checks running in a worker, with live progress updates.
+  </Card>
+  <Card title="JWT auth + roles" icon="shield">
+    Coordinators see their site's data; sponsors see all sites. Real RBAC.
+  </Card>
+  <Card title="Production polish" icon="rocket">
+    Logging, metrics, tests, Docker, migrations — everything a deployable service needs.
+  </Card>
+</CardGroup>
+
+## How this training works
+
+<Steps>
+  <Step title="Read a concept">
+    Each module opens with a short *what + why*. Skim, don't memorize.
+  </Step>
+  <Step title="Walk through working code">
+    I scaffold the file. You read every line. Friction is the point.
+  </Step>
+  <Step title="Do the exercise">
+    5–15 lines of code that *you* write. This is where it sticks.
+  </Step>
+  <Step title="Verify it works">
+    Run the commands. Compare output. If broken, debug — that's also learning.
+  </Step>
+  <Step title="Move to the next module">
+    Tell me you're done; we go to the next concept.
+  </Step>
+</Steps>
+
+## Why this approach works
+
+<Tip>
+  Reading code feels productive but is forgotten in a week. **Writing 10 lines** of meaningful code per module is what locks the concept in. Every module has an exercise — don't skip them.
+</Tip>
+
+## What makes this different from a tutorial
+
+| Most tutorials | This training |
+|---|---|
+| One file with everything | Real layered structure from Module 04 |
+| `print()` for debugging | Structured logging from Module 20 |
+| No tests | Tests from Module 22 |
+| Plain dicts as data | Pydantic + SQLAlchemy |
+| Mocks the worker | Real async worker with cooperative cancellation |
+| "Auth left as exercise" | JWT + RBAC fully built |
+| Stops at "it runs" | Goes through Docker + production deploy |
+
+## What you should already know
+
+- Python basics (functions, classes, dictionaries)
+- Used a terminal before
+- Edited code in any editor
+
+That's it. We cover everything else.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="terminal" href="/quickstart">
+    Set up your environment in 5 minutes.
+  </Card>
+  <Card title="Problem statement" icon="book" href="/problem-statement">
+    Understand exactly what we're building.
+  </Card>
+  <Card title="Learning path" icon="map" href="/learning-path">
+    See all 36 modules at a glance.
+  </Card>
+  <Card title="Start Module 01" icon="rocket" href="/modules/01-hello-fastapi">
+    Hello FastAPI — your first endpoint.
+  </Card>
+</CardGroup>

@@ -1,0 +1,320 @@
+---
+title: "25 · Docker"
+description: "Dockerfile, multi-stage builds, docker-compose with Postgres."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** `docker compose up` runs API + Postgres + Redis. Same image runs in dev, staging, prod.
+</Tip>
+
+## Concept
+
+Docker turns "works on my machine" into "works wherever Docker runs". Your image bundles:
+
+- The Python interpreter (specific version)
+- Your dependencies (specific versions)
+- Your code
+
+So dev, CI, staging, and prod all run the *exact same* binary. Config differs (env vars), code doesn't.
+
+### Multi-stage builds
+
+A naive single-stage image is huge (build tools, caches, compilers). **Multi-stage** builds in two steps: first stage resolves and installs into a venv; second stage copies only the venv.
+
+```
+┌──────────────────────────────────────┐
+│  Stage 1: builder                     │
+│  - python + uv binary                 │
+│  - uv sync --frozen → builds .venv    │
+└──────────────────────────────────────┘
+                  ↓
+┌──────────────────────────────────────┐
+│  Stage 2: runtime                     │
+│  - python only (no build tools)       │
+│  - copies .venv from stage 1          │
+│  - 4× smaller image                   │
+└──────────────────────────────────────┘
+```
+
+## Walkthrough
+
+### Step 1 — `Dockerfile`
+
+<Note>
+  The Dockerfile assumes (a) you have a `uv.lock` file (run `uv lock` once if not), and (b) you completed Module 07 so an `alembic/` directory and `alembic.ini` exist. If you skipped migrations, drop the two `COPY` lines for `alembic/` and `alembic.ini` and run schema setup another way.
+</Note>
+
+```dockerfile Dockerfile
+# ─── Stage 1: build (uv-based) ────────────────────────────────
+FROM python:3.12-slim AS builder
+
+# Install uv from the official image — small, single binary
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1
+
+WORKDIR /app
+
+# Install deps using the lockfile — reproducible builds
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-install-project --no-dev
+
+# ─── Stage 2: runtime ─────────────────────────────────────────
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+# Run as non-root
+RUN useradd --create-home --shell /bin/bash app
+
+WORKDIR /app
+
+# Copy the venv built in stage 1
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+
+# Copy the application code
+COPY --chown=app:app app ./app
+COPY --chown=app:app alembic ./alembic
+COPY --chown=app:app alembic.ini .
+COPY --chown=app:app pyproject.toml .
+
+USER app
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request, sys; \
+                   sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### Step 2 — `.dockerignore`
+
+```text .dockerignore
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.sqlite*
+.git/
+.gitignore
+.env
+.env.local
+.env.production
+docs/
+tests/
+logs/
+.pytest_cache/
+.coverage
+.DS_Store
+.vscode/
+.idea/
+```
+
+A tight `.dockerignore` is what keeps your image tiny. **Always include `.env` and any local DBs** — they're sensitive and not meant for the image.
+
+### Step 3 — `docker-compose.yml`
+
+```yaml docker-compose.yml
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: enrollment
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-dev_password_change_me}
+      POSTGRES_DB: enrollment
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enrollment"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "5432:5432"   # only for local debugging — don't expose in prod
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENROLLMENT_DB_URL: postgresql+asyncpg://enrollment:${DB_PASSWORD:-dev_password_change_me}@postgres:5432/enrollment
+      ENROLLMENT_SECRET_KEY: ${SECRET_KEY:?must set SECRET_KEY}
+      ENROLLMENT_LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENROLLMENT_CORS_ORIGINS: '["http://localhost:3000"]'
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app           # hot-reload during dev
+      - ./alembic:/app/alembic
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres-data:
+```
+
+### Step 4 — Switch the DB driver
+
+We've been on SQLite via `aiosqlite`. For Postgres, add `asyncpg`:
+
+```bash
+uv add asyncpg
+```
+
+The connection string in compose (`postgresql+asyncpg://...`) handles the rest. Your code doesn't change at all.
+
+### Step 5 — Build and run
+
+```bash
+# First-time secret
+SECRET_KEY=$(openssl rand -hex 32) docker compose up --build
+
+# Subsequent runs (assuming SECRET_KEY in env or .env file)
+docker compose up
+```
+
+The first boot creates an empty Postgres DB; either let lifespan migrations from Module 07 take over, or apply migrations explicitly:
+
+```bash
+docker compose run --rm api alembic upgrade head
+```
+
+Open [http://localhost:8000/docs](http://localhost:8000/docs) — same API, now backed by Postgres.
+
+```bash
+# Stop and clean
+docker compose down
+
+# Stop and clean WITH volumes (fresh DB)
+docker compose down -v
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why `python:3.12-slim` and not `python:3.12`?">
+    `slim` is the minimal Debian image (~150 MB vs ~900 MB). `alpine` is even smaller but uses musl libc — some Python packages don't ship binary wheels for it, forcing source compiles. `slim` is the sweet spot.
+  </Accordion>
+  <Accordion title="Why a venv at `/app/.venv` instead of system Python?">
+    `uv sync` builds an isolated `.venv` we can copy verbatim from the builder stage. The runtime image carries only that venv — no uv, no build tools, no caches. Tiny.
+  </Accordion>
+  <Accordion title="`USER app` — non-root?">
+    Best practice. If a vulnerability lets an attacker execute code, they're confined to the `app` user's permissions, not root.
+  </Accordion>
+  <Accordion title="`HEALTHCHECK`">
+    Docker pings this command periodically. `docker ps` shows healthy/unhealthy status. Compose uses it for `depends_on: condition: service_healthy`. Kubernetes uses similar for readiness probes (Module 26).
+  </Accordion>
+  <Accordion title="Why `COPY pyproject.toml uv.lock` BEFORE `COPY app`?">
+    Docker layers cache. The `uv sync` layer is expensive; if only code changed (not deps), Docker reuses the cached install layer. Speeds up rebuild from minutes to seconds. uv is also significantly faster than pip on a cold install — typically 10×.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Build">
+    ```bash
+    SECRET_KEY=$(openssl rand -hex 32) docker compose build
+    ```
+    First build is slow (downloading images + installing deps). Subsequent builds are fast (Docker cache).
+  </Step>
+  <Step title="Run">
+    ```bash
+    SECRET_KEY=$(openssl rand -hex 32) docker compose up
+    ```
+    Three services: postgres, redis, api. The API connects to postgres on the internal network.
+  </Step>
+  <Step title="Hit the API">
+    ```bash
+    curl http://localhost:8000/health
+    # {"status":"ok"}
+    ```
+  </Step>
+  <Step title="Inspect image size">
+    ```bash
+    docker images | grep enrollment
+    # Should be ~200-250 MB
+    ```
+  </Step>
+  <Step title="Tear down">
+    ```bash
+    docker compose down -v
+    ```
+    Volumes deleted; next start is fresh.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I run migrations in the Dockerfile or at startup?">
+    Startup. The Dockerfile only builds the image; it doesn't have access to the production DB. Run `alembic upgrade head` in lifespan (Module 07) so it runs against the *target* DB.
+  </Accordion>
+  <Accordion title="Why are migrations run via subprocess?">
+    Alembic's online mode internally calls `asyncio.run`, which fails inside an already-running async lifespan. Subprocess sidesteps this. AnnotateHub uses the same pattern.
+  </Accordion>
+  <Accordion title="`uv sync --frozen --no-install-project --no-dev` — what?">
+    `--frozen` uses the exact versions in `uv.lock` (refuses to re-resolve). `--no-install-project` skips installing the app itself (we're not packaging it; just deps). `--no-dev` skips test/lint deps. Result: the smallest possible runtime venv.
+  </Accordion>
+  <Accordion title="My image is 1 GB — what's going on?">
+    Top suspects: forgot `.dockerignore` (copying `.venv/`, `node_modules/`, etc.), no multi-stage (build tools in runtime), bloated base image (`python:3.12` instead of `slim`).
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a **dev override** file `docker-compose.override.yml` that:
+
+    1. Mounts `./tests` as a volume so you can run tests against the running container.
+    2. Sets `ENROLLMENT_LOG_LEVEL=DEBUG`.
+    3. Adds a `pgadmin` service (postgres GUI) on port 5050.
+
+    Compose automatically merges `docker-compose.yml` and `docker-compose.override.yml`. The override stays in dev only — production deploys use `docker-compose.yml` alone.
+  </Tab>
+  <Tab title="Hint">
+    `image: dpage/pgadmin4` for the GUI. Set `PGADMIN_DEFAULT_EMAIL` and `PGADMIN_DEFAULT_PASSWORD` env vars.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/25-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **A good Dockerfile is a teaching artifact.** Reading it tells you exactly what your service needs and how it's deployed. Bad ones obscure dependencies, embed secrets, run as root, leave caches in. Take 10 minutes to make yours small, fast, secure — that's a 10-minute investment that pays off every CI build forever.
+</Tip>
+
+## Real-world reference
+
+- `Final CRF Annotation/annotate-hub-api/Dockerfile`
+- `Final CRF Annotation/docker-compose.yml`
+
+## Next module
+
+<Card title="Module 26: Deployment" icon="rocket" href="/modules/26-deployment">
+  Health probes, gunicorn workers, graceful shutdown.
+</Card>

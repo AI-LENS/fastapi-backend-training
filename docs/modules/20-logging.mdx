@@ -1,0 +1,348 @@
+---
+title: "20 · Structured logging"
+description: "JSON logs, correlation IDs, log levels, log fields. Debugging production starts here."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** Every log line is JSON, carries the request ID and user context, and is queryable by field.
+</Tip>
+
+## Concept
+
+`logger.info("Processing screening")` is fine. `logger.info("Processing screening %s for user %s", id, user_id)` is better. **Structured JSON logs** are best:
+
+```json
+{
+  "ts": "2026-05-01T12:34:56.789Z",
+  "level": "INFO",
+  "logger": "app.services.screening_service",
+  "message": "Processing screening",
+  "request_id": "abc-123",
+  "user_id": "alice@x.com",
+  "screening_id": "7f3a...",
+  "site_id": "SITE-001"
+}
+```
+
+Now you can query "all logs where `screening_id == X`" instead of grepping text. **This is what makes production debugging tractable.**
+
+### What to log, what to log as a field
+
+| In the message | As a field |
+|---|---|
+| Verbs ("Created", "Validated", "Failed") | IDs (request_id, user_id, resource_id) |
+| Phase ("Pipeline started") | Numbers (duration_ms, attempt) |
+| Outcomes ("Eligible", "Rejected") | Tags (tenant, environment) |
+
+### What to NEVER log
+
+- Passwords, tokens, secrets, API keys
+- Full request bodies that may contain PII
+- Personally Identifiable Information (PII)
+
+## Walkthrough
+
+We use **`structlog`** — the canonical structured logging library for Python.
+
+### Step 1 — Install
+
+```bash
+uv add 'structlog>=23'
+```
+
+Pin `>=23` because Step 7 below uses `structlog.contextvars.get_contextvars()`, which only exists in structlog 23+.
+
+### Step 2 — Logging configuration
+
+```python app/core/__init__.py
+# empty
+```
+
+```python app/core/logging.py
+"""Structured logging configuration.
+
+structlog wraps Python's stdlib `logging` to produce JSON output.
+Anything attached to a `logger.bind()` call shows up as a JSON field.
+"""
+import logging
+import sys
+
+import structlog
+
+from app.config import settings
+
+
+def configure_logging() -> None:
+    """Set up structured logging once at app startup."""
+    timestamper = structlog.processors.TimeStamper(fmt="iso", utc=True)
+
+    shared_processors: list = [
+        structlog.contextvars.merge_contextvars,   # ← reads ContextVar (request_id, etc.)
+        structlog.stdlib.add_log_level,
+        structlog.stdlib.add_logger_name,
+        timestamper,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+
+    structlog.configure(
+        processors=shared_processors + [
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+    formatter = structlog.stdlib.ProcessorFormatter(
+        foreign_pre_chain=shared_processors,
+        processors=[
+            structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+            structlog.processors.JSONRenderer(),
+        ],
+    )
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers = [handler]
+    root.setLevel(settings.log_level)
+
+    # Quiet noisy libs
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
+    """Get a logger. By convention `name = __name__`."""
+    return structlog.stdlib.get_logger(name)
+```
+
+### Step 3 — Call from `main.py`
+
+```python app/main.py
+from app.core.logging import configure_logging, get_logger
+
+configure_logging()
+logger = get_logger(__name__)
+```
+
+Replace all `logger = logging.getLogger(__name__)` across the codebase with `from app.core.logging import get_logger; logger = get_logger(__name__)`.
+
+### Step 4 — Bind correlation IDs in middleware
+
+We **add** to the middleware Module 18 wrote — keep its `request_id_var` ContextVar and `get_request_id()` helper so existing call sites (the Module 18 exception handler, anything else reading the ID) keep working. We just ALSO push the ID into structlog's contextvars so JSON logs get it for free.
+
+```python app/middleware/request_id.py
+from contextvars import ContextVar
+from uuid import uuid4
+
+import structlog
+from structlog.contextvars import bind_contextvars, clear_contextvars
+from starlette.middleware.base import BaseHTTPMiddleware
+
+# Keep the existing ContextVar + getter from Module 18.
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+
+def get_request_id() -> str | None:
+    return request_id_var.get()
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        rid = request.headers.get("x-request-id") or str(uuid4())
+        token = request_id_var.set(rid)
+        bind_contextvars(request_id=rid)   # ← every log line in this request gets request_id
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = rid
+            return response
+        finally:
+            clear_contextvars()
+            request_id_var.reset(token)
+```
+
+Now any `logger.info(...)` call from anywhere in the call chain automatically includes `request_id` as a JSON field, and any code that already calls `get_request_id()` (like the Module 18 exception handler) keeps working.
+
+### Step 5 — Bind user context after auth
+
+In a dependency or middleware *after* `get_current_user`:
+
+```python app/dependencies.py
+import structlog
+
+
+async def get_current_user(...):
+    user = ...   # existing logic
+    structlog.contextvars.bind_contextvars(
+        user_id=str(user.id),
+        user_role=user.role,
+        site_id=user.site_id,
+    )
+    return user
+```
+
+Every subsequent log line inherits the user context.
+
+### Step 6 — Use it in services
+
+```python app/services/screening_service.py
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+async def submit_screening(uow, runner, progress, *, user, payload):
+    logger.info(
+        "screening.submit_attempt",
+        site_id=payload.site_id,
+        candidate_initials=payload.candidate_initials,
+    )
+    async with uow:
+        # ... validation ...
+        screening = await repo.create(uow.session, **payload.model_dump())
+        logger.info(
+            "screening.submitted",
+            screening_id=str(screening.id),
+            site_id=screening.site_id,
+        )
+        # ... rest
+        return screening
+```
+
+Notice the **event-style messages** (`screening.submit_attempt`, `screening.submitted`). They're stable identifiers you can search/alert on, separate from human-readable detail.
+
+### Step 7 — Workers inherit context
+
+In the background runner:
+
+```python app/workers/task_runner.py
+# This snippet only shows the change to `submit`. The rest of `BackgroundTaskRunner`
+# (the `_tasks` dict, `_semaphore`, `shutdown`, etc.) stays as you wrote it in Module 13 / 13b.
+from structlog.contextvars import bind_contextvars, clear_contextvars
+import structlog
+
+class BackgroundTaskRunner:
+    def submit(self, key: UUID, coro_factory) -> None:
+        # Snapshot the current request's context so the worker logs carry it
+        ctx = structlog.contextvars.get_contextvars()   # requires structlog>=23
+
+        async def runner():
+            async with self._semaphore:
+                # Re-bind in this task's context
+                bind_contextvars(**ctx)
+                try:
+                    await coro_factory()
+                finally:
+                    clear_contextvars()
+
+        self._tasks[key] = asyncio.create_task(runner())
+```
+
+Now **worker logs include the request_id of the request that scheduled them** — gold for tracing async flows.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why structlog and not stdlib `logging` with a JSON formatter?">
+    `logging` doesn't pass key-value fields nicely. structlog is designed around them — you write `logger.info("event", key=value)`. The `merge_contextvars` processor automatically injects ContextVar fields. With stdlib you'd manually pass everything.
+  </Accordion>
+  <Accordion title="What's the difference between `bind_contextvars` and `logger.bind(...)`?">
+    `bind_contextvars` is global — every logger in this task chain inherits the bound fields. `logger.bind` returns a new logger with extra fields, scoped to that variable. Use `bind_contextvars` for request/user context. Use `logger.bind` for ad-hoc additions like `logger.bind(stage="check_age").info(...)`.
+  </Accordion>
+  <Accordion title="JSON logs in dev are ugly to read — is there a pretty option?">
+    Yes. Replace `JSONRenderer()` with `ConsoleRenderer()` in dev:
+    ```python
+    if settings.log_level == "DEBUG":
+        renderer = structlog.dev.ConsoleRenderer(colors=True)
+    else:
+        renderer = structlog.processors.JSONRenderer()
+    ```
+    JSON for production (parsed by your log aggregator), pretty for dev.
+  </Accordion>
+  <Accordion title="What happens to the audit logs we built earlier?">
+    Audit logs (Module 17c) live in the DB. Application logs (this module) live in stdout/aggregator. Different concerns: audit is for compliance, app logs are for debugging. **Don't conflate them.**
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart the server">
+    Logs are now JSON.
+  </Step>
+  <Step title="Hit an endpoint with a request ID">
+    ```bash
+    curl -H "Authorization: Bearer $ALICE" -H "X-Request-ID: trace-1" \
+      http://localhost:8000/api/v1/screenings | python3 -m json.tool > /dev/null
+    ```
+    Server logs (Uvicorn console) show:
+    ```json
+    {"event":"screening.submit_attempt","timestamp":"2026-05-01T...","level":"info","request_id":"trace-1","user_id":"...","user_role":"coordinator","site_id":"SITE-001",...}
+    ```
+  </Step>
+  <Step title="Submit a screening, watch the worker logs">
+    The worker's logs include the same `request_id` as the submitting request. **You can grep one request's complete journey by ID.**
+  </Step>
+  <Step title="Pipe to jq for queries">
+    Pipe Uvicorn output to a file, then:
+    ```bash
+    jq 'select(.request_id == "trace-1")' app.log
+    jq 'select(.level == "error")' app.log
+    ```
+    Real production: aggregator (Datadog, ELK, Loki) does this automatically.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I include the message text or just the event identifier?">
+    Both. `event="screening.submitted"` for filtering, plus a `message=` field if helpful. Some teams skip the message and just rely on event names.
+  </Accordion>
+  <Accordion title="Why isn't there a `host` or `service` field?">
+    Add them. In production you bind `service="enrollment-api"` and `host=hostname` once at startup. The aggregator typically injects these too.
+  </Accordion>
+  <Accordion title="What log level for what?">
+    `DEBUG` — verbose dev info; off in prod. `INFO` — normal events (login, screening submitted). `WARNING` — recoverable problems (cache miss-storm, retry triggered). `ERROR` — unhandled exceptions. `CRITICAL` — service-down events.
+  </Accordion>
+  <Accordion title="What about high-cardinality fields?">
+    `screening_id` is high-cardinality (millions of values). Some log systems charge per unique value of indexed fields. Don't index high-cardinality fields by default; they're searchable as raw text.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add **timing for the eligibility pipeline**:
+
+    1. In the worker, log `pipeline.started` with `screening_id`.
+    2. After the pipeline finishes, log `pipeline.completed` with `screening_id`, `duration_ms`, `eligible`, `failed_count`.
+    3. On exception, log `pipeline.failed` at ERROR level with `screening_id`, `error`.
+  </Tab>
+  <Tab title="Hint">
+    `time.monotonic()` for the start timestamp, subtract at end for `duration_ms`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/20-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **A log line you can't query is a log line you can't use.** The structured JSON discipline pays off the moment a customer says "my screening from Tuesday at 3 PM stuck on `reviewing`". With structured logs, you query `event=pipeline.* AND screening_id=...` and the entire flow appears in seconds. Without, you grep through gigabytes of plain text.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/main.py:15-21` — basic logging. The structured approach in this module is the upgrade path.
+
+## Next module
+
+<Card title="Module 21: Metrics & tracing" icon="chart-bar" href="/modules/21-metrics-tracing">
+  Beyond logs — metrics for "how many" and traces for "where the time went".
+</Card>

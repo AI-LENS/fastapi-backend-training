@@ -1,0 +1,50 @@
+---
+title: "03 · Solution"
+description: "DELETE /screenings/{id} with status-aware behavior."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+Add to `app/routers/screenings.py`:
+
+```python
+@router.delete("/{screening_id}", status_code=204)
+def delete_screening(screening_id: UUID):
+    screening = _screenings.get(screening_id)
+    if screening is None:
+        raise HTTPException(status_code=404, detail="Screening not found")
+    if screening["status"] != "submitted":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete screening in status {screening['status']}",
+        )
+    del _screenings[screening_id]
+    return None
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why 204 instead of 200?">
+    Convention: `204 No Content` means "I did the thing, there's nothing to return". A delete that succeeded has no useful body. FastAPI returns an empty body when the function returns `None` and the route is declared with `status_code=204`.
+  </Accordion>
+  <Accordion title="Why 409 instead of 400 for bad status?">
+    `400 Bad Request` is for malformed requests (bad JSON, missing fields). `409 Conflict` is for "request was valid, but the resource is in a state that conflicts with this operation". State-based rejections almost always want 409.
+  </Accordion>
+  <Accordion title="Why `_screenings.get(screening_id)` instead of `_screenings[screening_id]`?">
+    `.get()` returns `None` for missing keys; bracket access raises `KeyError`. Using `.get()` lets us check and return a clean 404 instead of a 500.
+  </Accordion>
+</AccordionGroup>
+
+## Variations to explore
+
+- Try `DELETE /screenings/not-a-uuid` — FastAPI returns 422 *before* your function runs (path validation is a separate layer).
+- Add an `?force=true` query param that lets sponsors delete in any status. (We'll do this properly in Module 17.)
+
+## Next
+
+<Card title="Module 04: Project structure" icon="folder" href="/modules/04-project-structure">
+  App factory, lifespan, settings.
+</Card>

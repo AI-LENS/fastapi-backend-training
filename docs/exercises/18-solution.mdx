@@ -1,0 +1,90 @@
+---
+title: "18 · Solution"
+description: "Slow-request alert middleware."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/config.py
+class Settings(BaseSettings):
+    # ...
+    slow_request_ms: int = 500
+```
+
+```python app/middleware/slow.py
+import logging
+import time
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.config import settings
+from app.middleware.request_id import get_request_id
+
+logger = logging.getLogger("http.slow")
+
+
+class SlowRequestMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.monotonic()
+        response = await call_next(request)
+        duration_ms = (time.monotonic() - start) * 1000
+
+        if duration_ms > settings.slow_request_ms:
+            logger.warning(
+                "SLOW: %s %s took %.1fms (threshold %dms)",
+                request.method,
+                request.url.path,
+                duration_ms,
+                settings.slow_request_ms,
+                extra={
+                    "request_id": get_request_id(),
+                    "method": request.method,
+                    "path": request.url.path,
+                    "duration_ms": round(duration_ms, 1),
+                },
+            )
+        return response
+```
+
+```python app/main.py
+from app.middleware.slow import SlowRequestMiddleware
+
+# Mount AFTER access log so warnings appear AFTER the regular log line
+app.add_middleware(SlowRequestMiddleware)
+app.add_middleware(AccessLogMiddleware)
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(CORSMiddleware, ...)
+```
+
+## Verify
+
+```python
+# In any route, temporarily:
+import asyncio
+
+@app.get("/slow")
+async def slow():
+    await asyncio.sleep(0.6)
+    return {"ok": True}
+```
+
+```bash
+curl http://localhost:8000/slow
+# Logs:
+# INFO http.access GET /slow -> 200 in 603.1ms
+# WARNING http.slow SLOW: GET /slow took 603.1ms (threshold 500ms)
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why is the order weird?">
+    Middleware runs request-side **top to bottom** but response-side **bottom to top**. The "slow" middleware mounted *first* sees the response *last* — so its timing measurement reflects everything below it. Mount it where you want to measure-from.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 18b: Permission service" icon="key" href="/modules/18b-permission-service" />

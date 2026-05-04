@@ -1,0 +1,80 @@
+---
+title: "20 · Solution"
+description: "Pipeline timing logs."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/services/screening_service.py
+import time
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+async def run_eligibility_pipeline(runner, db_factory, progress, screening_id):
+    async def _job():
+        async with db_factory() as db:
+            screening = await get_screening_unchecked(db, screening_id)  # internal helper
+            if screening.status != "submitted":
+                return
+            await repo.update_status(db, screening, status="reviewing")
+
+            logger.info("pipeline.started", screening_id=str(screening_id))
+            start = time.monotonic()
+
+            try:
+                outcome = await run_pipeline(screening, on_stage_complete=...)
+            except Exception as exc:
+                duration_ms = round((time.monotonic() - start) * 1000, 1)
+                logger.error(
+                    "pipeline.failed",
+                    screening_id=str(screening_id),
+                    duration_ms=duration_ms,
+                    error=str(exc),
+                )
+                raise
+
+            duration_ms = round((time.monotonic() - start) * 1000, 1)
+            await repo.update_status(
+                db, screening,
+                status="eligible" if outcome.eligible else "ineligible",
+                eligibility_result="eligible" if outcome.eligible else "ineligible",
+                failed_criteria=outcome.failed_criteria,
+            )
+
+            logger.info(
+                "pipeline.completed",
+                screening_id=str(screening_id),
+                duration_ms=duration_ms,
+                eligible=outcome.eligible,
+                failed_count=len(outcome.failed_criteria),
+            )
+
+    runner.submit(screening_id, _job)
+```
+
+## Verify
+
+Submit a screening. The Uvicorn console shows three structured log lines:
+
+```json
+{"event":"pipeline.started","screening_id":"...","request_id":"...",...}
+{"event":"pipeline.completed","screening_id":"...","duration_ms":12.4,"eligible":true,"failed_count":0,"request_id":"...",...}
+```
+
+The `request_id` matches the originating POST — that's the value of context propagation through the worker.
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why three separate log events?">
+    Each is a queryable signal. "How many pipelines started today" uses `event=pipeline.started`. "Average duration" uses `pipeline.completed`. "Failure rate" uses `pipeline.failed`. Don't fold them into one ambiguous event.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 21: Metrics & tracing" icon="chart-bar" href="/modules/21-metrics-tracing" />

@@ -1,0 +1,268 @@
+---
+title: "10 · Dependency injection deep-dive"
+description: "Depends(), sub-dependencies, scopes, dependency_overrides — the FastAPI superpower."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~10 lines · **Outcome:** Clean DI providers in `app/dependencies.py`. Solid mental model for `Depends()`.
+</Tip>
+
+## Concept
+
+You've already used `Depends(get_db)` in every route. Time to understand what's actually happening.
+
+### What `Depends()` does
+
+When FastAPI sees `param = Depends(some_func)` in a route signature, it:
+
+1. **Calls `some_func()`** — passing it any of *its* dependencies, recursively
+2. **Caches the result** for the duration of this request (so repeated `Depends(get_db)` returns the same session)
+3. **Passes the result** to the route as that parameter
+4. **Cleans up** if the dependency uses `yield` (runs the post-yield code)
+
+### Three patterns we'll use
+
+<CardGroup cols={3}>
+  <Card title="Simple" icon="puzzle-piece">
+    `def get_settings(): return settings`
+    Returns a value. No setup/teardown.
+  </Card>
+  <Card title="Yield-based" icon="rocket">
+    `async def get_db(): async with X() as s: yield s`
+    Setup before yield, teardown after.
+  </Card>
+  <Card title="Sub-deps" icon="link">
+    `def f(x = Depends(g)): return ...`
+    Deps that themselves depend on other deps.
+  </Card>
+</CardGroup>
+
+### Caching: a critical detail
+
+```python
+@app.get("/x")
+def handler(
+    db1 = Depends(get_db),
+    db2 = Depends(get_db),
+):
+    assert db1 is db2  # SAME instance — cached within this request
+```
+
+This is what lets multi-layer DI work without spinning up duplicate resources. The session is created once per request, regardless of how many things depend on it.
+
+## Walkthrough
+
+### Step 1 — Centralize dependencies
+
+```python app/dependencies.py
+"""Dependency providers for the application.
+
+Every dep that's used by more than one route lives here.
+"""
+from collections.abc import AsyncGenerator
+
+from fastapi import Request
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import Settings, settings
+from app.database import async_session
+
+
+async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """Yield a database session per request. Closes on exit."""
+    async with async_session() as session:
+        yield session
+
+
+def get_settings() -> Settings:
+    """Inject the global Settings object. Override in tests for env-specific config."""
+    return settings
+
+
+def get_app_state(request: Request):
+    """Access the lifespan-attached app state.
+
+    Used by sub-deps that need long-lived resources (executors, clients).
+    Routes should NEVER access `request.app.state` directly — use a typed dep here.
+    """
+    return request.app.state
+```
+
+### Step 2 — Use it everywhere
+
+```python app/routers/screenings.py {3, 11}
+from app.dependencies import get_db_session
+
+# replace `db: AsyncSession = Depends(get_db)`
+# with     `db: AsyncSession = Depends(get_db_session)`
+```
+
+(Same change in `routers/sites.py` and the `/health/db` route in `main.py`.)
+
+You can also delete the `get_db` from `database.py` — `dependencies.py` is now the single source.
+
+### Step 3 — Demonstrate sub-dependencies
+
+This is what makes DI compose. Let's add a tiny example we'll expand to real auth in Module 16:
+
+```python app/dependencies.py
+# Append to your existing app/dependencies.py — `Depends` is already imported
+# at the top of the file from Step 1, alongside `get_settings`/`get_db_session`.
+from typing import Annotated
+
+from fastapi import Depends, Header, HTTPException
+
+
+def get_request_metadata(
+    x_request_source: Annotated[str | None, Header()] = None,
+    settings: Settings = Depends(get_settings),
+) -> dict:
+    """Synthesize a metadata dict for logging/auditing."""
+    return {
+        "source": x_request_source or "unknown",
+        "service_version": settings.app_version,
+    }
+```
+
+Now use it in a route:
+
+```python app/routers/screenings.py
+# At the top of the file, add the logger if you haven't:
+# import logging
+# logger = logging.getLogger(__name__)
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+async def create_screening(
+    payload: ScreeningCreate,
+    db: AsyncSession = Depends(get_db_session),
+    meta: dict = Depends(get_request_metadata),
+):
+    logger.info("create_screening: meta=%s", meta)
+    return await service.submit_screening(db, payload)
+```
+
+Notice how `get_request_metadata` itself uses `Depends(get_settings)` — that's a sub-dep. FastAPI resolves the chain automatically.
+
+### Step 4 — `dependency_overrides` (testing primer)
+
+The single most important DI feature for tests:
+
+```python
+# In a test
+def test_create_screening():
+    fake_settings = Settings(app_version="test")
+    app.dependency_overrides[get_settings] = lambda: fake_settings
+
+    # ... run a request ...
+    # FastAPI uses fake_settings instead of the real one
+
+    app.dependency_overrides.clear()
+```
+
+We'll lean on this hard in Module 23.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`Annotated[str | None, Header()]`">
+    The Pydantic-recommended Python 3.10+ way to write parameter metadata. Equivalent to `x_request_source: str | None = Header(default=None)` — but supports type checkers better. Either works.
+  </Accordion>
+  <Accordion title="Why pull `request.app.state` into a typed dep?">
+    Two reasons: (1) **Discoverability** — every long-lived resource is named at the top of `dependencies.py`. (2) **Testability** — overriding the dep is far cleaner than monkey-patching `app.state`. AnnotateHub's CLAUDE.md explicitly mandates this pattern.
+  </Accordion>
+  <Accordion title="When does dependency caching matter?">
+    Always. Without caching, expensive deps (like opening a DB connection) would run multiple times per request — once per route param that needs it. With caching, exactly once per dep per request.
+  </Accordion>
+  <Accordion title="Can I disable caching for a specific dep?">
+    Yes: `Depends(get_thing, use_cache=False)`. Useful if the dep returns a unique value each call (UUIDs, timestamps).
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Send a request with the source header">
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -H "X-Request-Source: terminal-test" \
+      -d '{"site_id":"SITE-001","candidate_initials":"CD","age":35,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["m"]}'
+    ```
+    Watch the API server log: it shows `meta={'source': 'terminal-test', 'service_version': '0.4.0'}`.
+  </Step>
+  <Step title="Send without the header">
+    Same curl, drop the `-H "X-Request-Source: ..."`.
+    Log shows `'source': 'unknown'`.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What's the difference between yield-based and return-based deps?">
+    Return: synchronous setup, no teardown. Yield: setup, hand off, teardown — like a context manager. Yield is for resources (DB, files, locks); return is for values (config, computed data).
+  </Accordion>
+  <Accordion title="Can deps be async?">
+    Yes — and they should be if they do I/O. Sync deps in async routes work but block the event loop.
+  </Accordion>
+  <Accordion title="What's the difference between `Depends()` and just calling the function?">
+    `Depends()` lets FastAPI manage caching, sub-dep resolution, and override hooks. Plain function calls bypass all of that. Use `Depends` for anything that should compose or be testable.
+  </Accordion>
+  <Accordion title="Can I inject deps into background tasks (the `BackgroundTasks` from Module 13)?">
+    Indirectly — capture the values from the route's deps and pass them as args to the task. Background tasks themselves don't run through DI.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a dep called `get_pagination(limit: int = 50, offset: int = 0)` that returns a `Pagination` named tuple (or dataclass) with `limit` and `offset` fields. Wire it into `list_screenings` so the endpoint accepts both `?limit=10&offset=20` query params via the dep.
+
+    The point: see how a dep can group related parameters. This pattern keeps route signatures clean as parameters multiply.
+
+    You'll write ~10 lines.
+  </Tab>
+  <Tab title="Hint">
+    ```python
+    from dataclasses import dataclass
+
+    @dataclass
+    class Pagination:
+        limit: int
+        offset: int
+
+    def get_pagination(limit: int = 50, offset: int = 0) -> Pagination:
+        return Pagination(limit=min(limit, 100), offset=max(offset, 0))
+    ```
+    The dep's parameters automatically become query params on the route — no manual `Query(...)` needed.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/10-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+curl 'http://localhost:8000/api/v1/screenings?limit=2&offset=0'
+# Returns at most 2 screenings
+
+curl 'http://localhost:8000/api/v1/screenings?limit=999'
+# Capped to 100 by your dep — no DoS via pagination
+```
+
+## Insight
+
+<Tip>
+  **Dependency injection is what makes FastAPI codebases *composable*.** Without DI, every route either re-creates everything it needs (slow, leaky) or grabs from globals (untestable, ordering-fragile). With DI, components declare their needs and the framework wires them up — the foundation of the testability you'll see in Module 23.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/dependencies.py` — `get_db_session`, `get_task_runner`, `get_progress_manager`, `get_current_user`, `require_role`. 60 lines that the entire codebase uses.
+
+## Next module
+
+<Card title="Module 11: Custom exceptions" icon="shield" href="/modules/11-exceptions">
+  Replace the route-level try/except chains with a centralized exception handler.
+</Card>

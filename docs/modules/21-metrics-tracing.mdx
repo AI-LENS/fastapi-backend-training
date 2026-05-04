@@ -1,0 +1,341 @@
+---
+title: "21 · Metrics & tracing"
+description: "Prometheus metrics, OpenTelemetry traces. The 'how many' and 'where did the time go'."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** `/metrics` endpoint exposes counters/histograms. OpenTelemetry trace spans wrap requests, services, and pipeline stages.
+</Tip>
+
+## Concept
+
+The **three pillars of observability**:
+
+<CardGroup cols={3}>
+  <Card title="Logs" icon="book">
+    What happened. (Module 20.)
+  </Card>
+  <Card title="Metrics" icon="chart-bar">
+    How many / how often / how fast. *Aggregate.* Counters, gauges, histograms.
+  </Card>
+  <Card title="Traces" icon="link">
+    Where the time went, across services. *Per-request.* Spans nested into a tree.
+  </Card>
+</CardGroup>
+
+### Four golden signals to track
+
+| Signal | What it tells you |
+|---|---|
+| **Latency** | How slow is the slowest 5% of requests? (p95/p99 latency) |
+| **Traffic** | How many requests per second? |
+| **Errors** | What's the error rate? |
+| **Saturation** | How close to capacity (CPU, DB pool, worker queue) are we? |
+
+These four cover most production troubleshooting needs.
+
+## Walkthrough
+
+### Part 1 — Prometheus metrics
+
+#### Step 1 — Install
+
+```bash
+uv add prometheus-client
+```
+
+#### Step 2 — Define metrics
+
+```python app/core/metrics.py
+"""Prometheus metrics. One module, all our counters and histograms."""
+from prometheus_client import Counter, Gauge, Histogram
+
+# HTTP request counters/histograms
+http_requests_total = Counter(
+    "enrollment_http_requests_total",
+    "Total HTTP requests",
+    ["method", "path", "status"],
+)
+
+http_request_duration_seconds = Histogram(
+    "enrollment_http_request_duration_seconds",
+    "HTTP request duration",
+    ["method", "path"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0),
+)
+
+# Pipeline metrics
+pipeline_runs_total = Counter(
+    "enrollment_pipeline_runs_total",
+    "Total pipeline runs",
+    ["outcome"],   # 'eligible' | 'ineligible' | 'failed'
+)
+
+pipeline_duration_seconds = Histogram(
+    "enrollment_pipeline_duration_seconds",
+    "Pipeline duration",
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0),
+)
+
+# Worker queue saturation
+worker_queue_size = Gauge(
+    "enrollment_worker_queue_size",
+    "Number of queued/running background jobs",
+)
+
+# Domain errors
+domain_errors_total = Counter(
+    "enrollment_domain_errors_total",
+    "Domain errors raised",
+    ["code"],
+)
+```
+
+#### Step 3 — Middleware to record HTTP metrics
+
+```python app/middleware/metrics.py
+import time
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.core.metrics import http_requests_total, http_request_duration_seconds
+
+
+class MetricsMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.perf_counter()
+        try:
+            response = await call_next(request)
+            status = response.status_code
+        except Exception:
+            status = 500
+            raise
+        finally:
+            duration = time.perf_counter() - start
+            # Use the route TEMPLATE (`/screenings/{id}`), not the literal URL —
+            # otherwise every UUID becomes its own label value and Prometheus
+            # cardinality explodes. `request.scope["route"]` is set by Starlette
+            # *after* the route matches; fall back to the literal path for
+            # unmatched 404s/middleware errors.
+            route = request.scope.get("route")
+            path = route.path if route is not None else request.url.path
+            http_requests_total.labels(
+                method=request.method, path=path, status=str(status)
+            ).inc()
+            http_request_duration_seconds.labels(
+                method=request.method, path=path
+            ).observe(duration)
+        return response
+```
+
+Mount in `main.py`:
+
+```python
+from app.middleware.metrics import MetricsMiddleware
+app.add_middleware(MetricsMiddleware)
+```
+
+#### Step 4 — Expose `/metrics`
+
+```python app/routers/metrics.py
+from fastapi import APIRouter, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
+router = APIRouter(tags=["ops"])
+
+
+@router.get("/metrics", include_in_schema=False)
+async def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+```
+
+Mount it (no auth needed — Prometheus scrapes it; protect at the network level):
+
+```python app/main.py
+from app.routers import metrics
+app.include_router(metrics.router)
+```
+
+#### Step 5 — Record pipeline metrics
+
+The `_job` below is the inner coroutine you defined inside `submit_screening` in Module 13 (the one passed to `BackgroundTaskRunner.submit`). Locate it and add the timing/counter lines around the `run_pipeline` call.
+
+```python app/services/screening_service.py
+from app.core.metrics import pipeline_duration_seconds, pipeline_runs_total
+
+
+async def submit_screening(uow, runner, progress, *, user, payload):
+    # ... existing UoW + screening insert ...
+
+    async def _job():
+        # ... existing setup (load screening, mark `reviewing`, etc.) ...
+        start = time.monotonic()
+        try:
+            outcome = await run_pipeline(screening, on_stage_complete=...)
+        except Exception:
+            pipeline_runs_total.labels(outcome="failed").inc()
+            raise
+        duration = time.monotonic() - start
+        pipeline_duration_seconds.observe(duration)
+        pipeline_runs_total.labels(
+            outcome="eligible" if outcome.eligible else "ineligible",
+        ).inc()
+        # ... rest of the job (persist result, etc.)
+
+    runner.submit(screening.id, _job)
+    return screening
+```
+
+#### Step 6 — Hook the exception handler
+
+`handle_domain_error` was registered in Module 11 and updated in Module 18 to include `request_id`. We **add** the metric increment without dropping that body:
+
+```python app/main.py
+from fastapi.responses import JSONResponse
+from app.core.metrics import domain_errors_total
+from app.middleware.request_id import get_request_id
+
+
+@app.exception_handler(DomainError)
+async def handle_domain_error(request, exc):
+    domain_errors_total.labels(code=exc.code).inc()
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": {
+                "code": exc.code,
+                "message": str(exc),
+                "details": exc.details,
+                "request_id": get_request_id(),
+            }
+        },
+    )
+```
+
+### Part 2 — OpenTelemetry tracing (overview)
+
+For training, we'll demo the *concept* with a small in-process span recorder. Production setup uses OpenTelemetry → OTLP → Tempo/Jaeger/Honeycomb.
+
+#### Conceptual: a span tree
+
+```
+[POST /screenings] (47ms)
+├── [auth.get_current_user] (3ms)
+├── [permission_service.ensure_can_submit] (1ms)
+├── [screening_service.submit_screening] (35ms)
+│   ├── [site_repository.get_by_id] (2ms)
+│   ├── [screening_repository.create] (28ms)
+│   │   └── [INSERT screenings] (25ms)   ← the slow piece
+│   └── [audit_repository.append] (4ms)
+└── [exit lifespan] (8ms)
+```
+
+You instantly see "the INSERT is 25ms — that's where the time goes". That's distributed tracing's superpower.
+
+#### Quick sketch (won't ask you to install OTel yet)
+
+```python
+from opentelemetry import trace
+tracer = trace.get_tracer(__name__)
+
+async def submit_screening(...):
+    with tracer.start_as_current_span("screening.submit_screening") as span:
+        span.set_attribute("site_id", payload.site_id)
+        # ... work ...
+```
+
+The full OTel setup is `uv add opentelemetry-instrumentation-fastapi` and a one-line auto-instrumentation. We mention it here; production setup is in Module 26c.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why histograms, not just averages?">
+    Averages hide tail latency. p99 (the slowest 1% of requests) is what users actually feel — and where bottlenecks hide. Histograms let Prometheus compute any percentile.
+  </Accordion>
+  <Accordion title="Why label by `path` template not URL?">
+    `/screenings/{id}` has 100 distinct URLs after 100 requests. If we labeled metrics by full URL, cardinality explodes (Prometheus stores one time series per label combination). Labeling by **template** keeps cardinality bounded.
+  </Accordion>
+  <Accordion title="Counter vs Gauge vs Histogram?">
+    **Counter** — only goes up (request count, error count). **Gauge** — can go up or down (queue size, active connections). **Histogram** — distribution (request duration). Use the right tool; mismatching causes confusing dashboards.
+  </Accordion>
+  <Accordion title="Why don't I need auth on `/metrics`?">
+    Prometheus scrapes it on a private network. You expose it to your monitoring system, not the internet. Network-level protection (private subnet, firewall) suffices.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart, hit some endpoints">
+    Submit screenings, check status, login, etc.
+  </Step>
+  <Step title="View raw metrics">
+    ```bash
+    curl http://localhost:8000/metrics
+    ```
+    You'll see lines like:
+    ```
+    enrollment_http_requests_total{method="POST",path="/api/v1/screenings",status="201"} 3.0
+    enrollment_pipeline_duration_seconds_bucket{le="0.5"} 3.0
+    enrollment_domain_errors_total{code="screening_not_found"} 1.0
+    ```
+  </Step>
+  <Step title="Compute p95 latency manually">
+    Look at the `_bucket` lines. The 95th percentile is the bucket where the cumulative count first exceeds 0.95 × total. (Prometheus Query Language — PromQL — does this with `histogram_quantile(0.95, ...)` in production.)
+  </Step>
+  <Step title="Force errors and observe the counter">
+    Hit a non-existent screening ID twice; observe `enrollment_domain_errors_total{code="screening_not_found"}` increment to 2.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="When do I add a new metric?">
+    When you'd want to alert on it or graph it over time. **"Was this request slow?"** → histogram. **"How many failed?"** → counter. **"How big is the queue right now?"** → gauge.
+  </Accordion>
+  <Accordion title="Should I sample tracing in production?">
+    Yes. 100% sampling is too expensive at scale. Common: 10% baseline + 100% of errors + 100% of slow requests. The OpenTelemetry SDK has built-in samplers.
+  </Accordion>
+  <Accordion title="Logs vs metrics — what goes where?">
+    **Metrics** for things you want to count, average, or alert on (latency, errors per minute, queue depth). **Logs** for things you want to *read* (specific events, error details). Don't try to do both with one — they have very different cost/value curves.
+  </Accordion>
+  <Accordion title="What about distributed tracing across services?">
+    Each service propagates the trace context (via headers like `traceparent`). OpenTelemetry handles this automatically once both services are instrumented. The trace tree spans services.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a **`worker_queue_size`** gauge that updates whenever a job is submitted or completes.
+
+    1. Set `worker_queue_size.set(len(self._tasks))` in `BackgroundTaskRunner.submit` and at the end of the inner `runner` coroutine.
+    2. Submit a few screenings rapidly and observe the gauge value via `/metrics`.
+
+    Optional: visualize it via Grafana (Module 26c).
+  </Tab>
+  <Tab title="Hint">
+    The `task_runner` already tracks tasks in `self._tasks`. Update the gauge after each insertion/completion. Use `worker_queue_size.set(len(...))`, not `.inc()` — the value is absolute.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/21-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Logs answer "what happened to this one request?". Metrics answer "what's happening right now?". Traces answer "where did the time go?".** They're three different views of the same world. Production debugging needs all three. Skipping any one of them is leaving 33% of your observability on the table.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub doesn't expose metrics or implement tracing yet. Both are common gaps that production teams add post-MVP.
+
+## Next module
+
+<Card title="Module 22: Unit tests" icon="puzzle-piece" href="/modules/22-unit-tests">
+  Now that observability is in place, write the tests that prevent regressions in the first place.
+</Card>

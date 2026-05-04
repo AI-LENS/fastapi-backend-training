@@ -1,0 +1,89 @@
+---
+title: "09 · Solution"
+description: "Update eligibility service operation."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Service additions
+
+```python app/services/screening_service.py
+class AlreadyDecided(ServiceError):
+    pass
+
+
+_TERMINAL_STATES = {"enrolled", "ineligible"}
+
+
+async def update_eligibility(
+    db: AsyncSession,
+    screening_id: UUID,
+    *,
+    eligible: bool,
+    failed_criteria: list[str],
+) -> Screening:
+    """Set the eligibility result of a still-pending screening."""
+    screening = await get_screening(db, screening_id)
+
+    if screening.status in _TERMINAL_STATES:
+        raise AlreadyDecided(
+            f"Screening {screening_id} is in terminal status {screening.status}"
+        )
+
+    new_status = "eligible" if eligible else "ineligible"
+    return await repo.update_status(
+        db,
+        screening,
+        status=new_status,
+        eligibility_result=new_status,
+        failed_criteria=failed_criteria,
+    )
+```
+
+## Schema for the request body
+
+```python app/schemas/screening.py
+class EligibilityUpdate(BaseModel):
+    eligible: bool
+    failed_criteria: list[str] = Field(default_factory=list)
+```
+
+## Route addition
+
+```python app/routers/screenings.py
+from app.schemas.screening import EligibilityUpdate
+
+
+@router.post("/{screening_id}/_set_eligibility", response_model=ScreeningResponse)
+async def set_eligibility(
+    screening_id: UUID,
+    payload: EligibilityUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        return await service.update_eligibility(
+            db,
+            screening_id,
+            eligible=payload.eligible,
+            failed_criteria=payload.failed_criteria,
+        )
+    except service.ScreeningNotFound as exc:
+        raise HTTPException(404, detail=str(exc))
+    except service.AlreadyDecided as exc:
+        raise HTTPException(409, detail=str(exc))
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why a `_TERMINAL_STATES` set?">
+    Set membership is O(1) and the spelling is explicit. If you add a third terminal state later, one place changes.
+  </Accordion>
+  <Accordion title="Why is the route prefixed with `_set_eligibility`?">
+    Underscore signals "internal/temporary". Module 14 replaces this with the real pipeline trigger; we don't want this endpoint to feel like a public API.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 10: Dependency injection" icon="link" href="/modules/10-dependency-injection" />

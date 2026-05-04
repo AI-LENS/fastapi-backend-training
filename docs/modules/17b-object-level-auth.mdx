@@ -1,0 +1,355 @@
+---
+title: "17b · Object-level authorization"
+description: "OWASP API #1 — per-object access control. The single most-missed production security bug."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~25 lines · **Outcome:** Coordinators cannot see or modify screenings outside their own site, even by changing IDs in URLs.
+</Tip>
+
+## Concept
+
+This is the **most important** security module in the curriculum.
+
+### The attack
+
+Alice is a coordinator at SITE-001. She uses the app and notices screening URLs like:
+
+```
+GET /api/v1/screenings/<some-uuid>
+```
+
+She tries:
+
+```
+GET /api/v1/screenings/<another-uuid>   ← someone else's screening
+```
+
+If your app returns Bob's screening, you have **Broken Object-Level Authorization (BOLA)** — OWASP API Security Top 10 #1, the most common API vulnerability in production.
+
+> Authentication asks "who are you?". RBAC asks "what role are you?". **Object-level auth asks: "can YOU access THIS specific resource?"**
+
+### Why RBAC is not enough
+
+```python
+@router.get("/{screening_id}", response_model=ScreeningResponse)
+async def get_screening(screening_id: UUID, user = Depends(get_current_user), ...):
+    return await service.get_screening(db, screening_id)
+```
+
+Alice has the coordinator role. The dep passes. The service returns whatever screening_id is. **Alice just read another site's data.** RBAC checks "is the door locked?" but this is about which rooms behind the door you may enter.
+
+### The fix: pass the user to the service, filter by ownership
+
+```python
+async def get_screening(uow, *, screening_id, user):
+    screening = await repo.get_by_id(uow.session, screening_id)
+    if screening is None:
+        raise ScreeningNotFound(...)
+    if not _user_can_access(user, screening):
+        raise ScreeningNotFound(...)   # ← raise NOT FOUND, not FORBIDDEN
+    return screening
+```
+
+### Why "404 Not Found" instead of "403 Forbidden"?
+
+Returning 403 for a resource that exists but isn't yours **leaks information**: "this ID exists somewhere — try to escalate". Returning 404 is **information-equivalent** to "this ID doesn't exist", giving attackers nothing to enumerate.
+
+This is a deliberate security pattern. It feels weird the first time you see it, but it's standard.
+
+## Walkthrough
+
+### Step 1 — Helper: who can access what
+
+```python app/services/permissions.py
+"""Object-level authorization helpers.
+
+These are the gatekeepers for *specific* resources. RBAC handles 'can this role
+do this kind of operation'; this module handles 'can this user access this
+specific instance'.
+"""
+from app.models.screening import Screening
+from app.models.user import User
+
+
+def can_access_screening(user: User, screening: Screening) -> bool:
+    """A user may access a screening if:
+      - they are a sponsor (sees all sites), OR
+      - they are a coordinator at the same site_id
+    """
+    if user.role == "sponsor":
+        return True
+    if user.role == "coordinator" and user.site_id == screening.site_id:
+        return True
+    return False
+
+
+def can_modify_screening(user: User, screening: Screening) -> bool:
+    """Stricter than read access — only the owning site's coordinator may modify."""
+    if user.role == "coordinator" and user.site_id == screening.site_id:
+        return True
+    return False  # NOT even sponsors — they oversee, not act
+```
+
+### Step 2 — Apply checks in the service
+
+```python app/services/screening_service.py
+from app.exceptions import Forbidden          # introduced in Module 17 (now in app/exceptions)
+from app.models.user import User
+from app.services import permissions
+
+
+async def get_screening(uow, *, screening_id: UUID, user: User) -> Screening:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None or not permissions.can_access_screening(user, screening):
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        return screening
+
+
+async def list_screenings(
+    uow,
+    *,
+    user: User,
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[Screening]:
+    """Coordinators always see their own site only; sponsors see all (or filtered)."""
+    if user.role == "coordinator":
+        # Force the filter — ignore client-supplied site_id
+        site_id = user.site_id
+
+    async with uow:
+        return await repo.list_filtered(uow.session, site_id=site_id, status=status, limit=limit)
+
+
+async def cancel_screening(uow, *, screening_id: UUID, user: User) -> None:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None or not permissions.can_access_screening(user, screening):
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        if not permissions.can_modify_screening(user, screening):
+            raise Forbidden("You cannot modify this screening")
+        if screening.status != "submitted":
+            raise CannotDelete(f"Cannot delete screening in status {screening.status}")
+        await repo.delete(uow.session, screening)
+
+
+async def enroll_screening(uow, *, screening_id: UUID, user: User) -> Screening:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None or not permissions.can_access_screening(user, screening):
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        if not permissions.can_modify_screening(user, screening):
+            raise Forbidden("You cannot enroll this screening")
+        if screening.status == "enrolled":
+            raise AlreadyEnrolled(...)
+        if screening.eligibility_result != "eligible":
+            raise IneligibleScreening(...)
+        subject_id = _generate_subject_id()
+        await repo.mark_enrolled(uow.session, screening, subject_id=subject_id)
+        return screening
+
+
+async def submit_screening(
+    uow,
+    runner,
+    progress,
+    *,
+    user: User,
+    payload: ScreeningCreate,
+) -> Screening:
+    """Coordinators may only submit screenings for their own site."""
+    if user.role == "coordinator" and user.site_id != payload.site_id:
+        raise Forbidden(
+            f"Coordinators may only submit for their own site (yours: {user.site_id})"
+        )
+
+    async with uow:
+        site = await site_repository.get_by_id(uow.session, payload.site_id)
+        if site is None or not site.active:
+            raise InvalidSite(...)
+        screening = await repo.create(uow.session, **payload.model_dump())
+        # ... (publish_after_commit as before)
+        return screening
+```
+
+### Step 3 — Update routes to pass the user
+
+Every endpoint that touches a screening now needs a `user: User = Depends(get_current_user)` parameter, and every service call needs the matching `user=` kwarg. Update all five endpoints — `create`, `get`, `list`, `delete`, `enroll` — together:
+
+```python app/routers/screenings.py
+@router.post("", ...)
+async def create_screening(
+    payload: ScreeningCreate,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+    runner = Depends(get_task_runner),
+    progress = Depends(get_progress_manager),
+):
+    return await service.submit_screening(
+        uow, runner, progress, user=user, payload=payload,
+    )
+
+
+@router.get("/{screening_id}", response_model=ScreeningResponse)
+async def get_screening(
+    screening_id: UUID,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+):
+    return await service.get_screening(uow, screening_id=screening_id, user=user)
+
+
+@router.get("", response_model=list[ScreeningResponse])
+async def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = settings.default_list_limit,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+):
+    return await service.list_screenings(
+        uow, user=user, site_id=site_id, status=status, limit=limit,
+    )
+
+
+@router.delete("/{screening_id}", status_code=204)
+async def delete_screening(
+    screening_id: UUID,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+):
+    await service.cancel_screening(uow, screening_id=screening_id, user=user)
+
+
+@router.post("/{screening_id}/enroll", response_model=ScreeningResponse)
+async def enroll(
+    screening_id: UUID,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+):
+    return await service.enroll_screening(uow, screening_id=screening_id, user=user)
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why does the service take `user`, not the route?">
+    Because the **decision** is a business decision: "can this user access this thing?" Routes are dumb adapters. The service decides; the route translates. This also means the same protection works if a CLI or worker calls the service.
+  </Accordion>
+  <Accordion title="404 vs 403 leak — what does it look like in practice?">
+    Imagine 1000 random UUIDs. With 403-on-other-site: 0 return 403 if Alice has 0 screenings (informative — none exist). 5 return 403 (5 exist somewhere — Alice now knows there are at least 5 other-site screenings). With 404-everywhere: 0 vs 5 are indistinguishable from outside. **404 = no information leak.**
+  </Accordion>
+  <Accordion title="What about list endpoints?">
+    Even bigger trap. If your `list_screenings` returns *all* screenings just because the role passes, the same data leak happens. **Always filter the query** by ownership at the service layer (`site_id = user.site_id` for coordinators).
+  </Accordion>
+  <Accordion title="`if user.role == 'coordinator': site_id = user.site_id`">
+    Forces the filter. Ignores client-supplied `?site_id=...`. Coordinators *cannot* widen their query, even if they try.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit a screening as Alice (SITE-001)">
+    ```bash
+    ALICE=$(curl -sX POST .../auth/login -d '{"email":"alice@example.com","password":"alice"}' | jq -r .access_token)
+
+    SID=$(curl -sX POST http://localhost:8000/api/v1/screenings \
+      -H "Authorization: Bearer $ALICE" \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"AA","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["m"]}' | jq -r .id)
+    echo "Alice's screening: $SID"
+    ```
+  </Step>
+  <Step title="Bob (SITE-002) tries to read it">
+    ```bash
+    BOB=$(curl -sX POST .../auth/login -d '{"email":"bob@example.com","password":"bob"}' | jq -r .access_token)
+
+    curl -i -H "Authorization: Bearer $BOB" http://localhost:8000/api/v1/screenings/$SID
+    # 404 — Bob can't see Alice's screening, AND can't tell it exists
+    ```
+  </Step>
+  <Step title="Sponsor reads it — should succeed">
+    ```bash
+    ADMIN=$(curl -sX POST .../auth/login -d '{"email":"admin@example.com","password":"admin"}' | jq -r .access_token)
+    curl -H "Authorization: Bearer $ADMIN" http://localhost:8000/api/v1/screenings/$SID | jq
+    # 200 with full data
+    ```
+  </Step>
+  <Step title="Bob tries to submit at SITE-001">
+    ```bash
+    curl -i -X POST http://localhost:8000/api/v1/screenings \
+      -H "Authorization: Bearer $BOB" \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"XX","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["m"]}'
+    # 403 — coordinators can only submit for their own site
+    ```
+  </Step>
+  <Step title="List as Alice, try to widen">
+    ```bash
+    curl -H "Authorization: Bearer $ALICE" 'http://localhost:8000/api/v1/screenings?site_id=SITE-002'
+    # Returns ONLY SITE-001 screenings — query parameter ignored
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should every entity have its own `can_access_X` function?">
+    Yes — one per resource type. They're a few lines each. The benefit is centralization: when the rules change, *one* file changes, and you can grep for ownership logic.
+  </Accordion>
+  <Accordion title="What about admin endpoints — should they also do object-level checks?">
+    Sponsors see everything by design (oversight role). Their access is "object-level" in the sense that they're allowed; the function still routes through `can_access_*`. So yes — same path, just different policy outcome.
+  </Accordion>
+  <Accordion title="What if a coordinator switches sites?">
+    Update `user.site_id` in the DB. New checks use the new value. Existing JWTs (with the old `site_id`) are still valid until expiry — that's the trade-off of stateless JWT. Mitigation: keep access tokens short (60 min like ours) or use a sessions table.
+  </Accordion>
+  <Accordion title="Could I do this filtering at the repo layer instead?">
+    Tempting, but no. The repo's job is "data". The decision "what data is this user allowed to see" is *policy* and belongs in the service. Repos shouldn't know about users.
+  </Accordion>
+  <Accordion title="What about object-level rate limits or quotas?">
+    Same pattern — service-level checks: `if user.daily_screening_count() >= user.daily_limit: raise`. Anything keyed on the user + the specific resource lives at the service.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a **field-level redaction**: when a `coordinator` reads someone else's screening (even if they're allowed to see it via some future rule), certain medical fields should be hidden.
+
+    For now, simulate: add a `ScreeningSummaryResponse` schema that includes only `id`, `site_id`, `status`, `created_at`. Add `GET /screenings/{id}/summary` that's accessible to all authenticated users (no object-level check) but returns this minimal shape.
+
+    Then verify Alice can hit `/screenings/{bob-id}/summary` even though she can't hit `/screenings/{bob-id}` directly.
+
+    **Why this matters:** real apps need redacted views (e.g., "you can see THAT a screening exists at another site, but not its medical details"). This is the entry point.
+  </Tab>
+  <Tab title="Hint">
+    1. New schema: `ScreeningSummaryResponse(BaseModel)` with the trimmed fields.
+    2. New service `get_screening_summary(uow, screening_id)` — no `user` param, no object-level check, but the *response model* hides the rest.
+    3. New route `GET /{id}/summary`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/17b-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The hidden cost of building authorization at the route layer is invisibility.** Permission checks scattered across 20 route files are impossible to audit. Centralized in `app/services/permissions.py`, they're a single file you can review, test, and reason about. The next time someone asks "who can do what in this system?" you can answer with a single grep.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub doesn't enforce per-site object scoping — it's a single-sponsor app. In multi-tenant clinical-trial systems (the real production case), the patterns in this module are *the* security boundary. Get them wrong and you've shipped a HIPAA violation.
+
+## Next module
+
+<Card title="Module 17c: Audit logs" icon="book" href="/modules/17c-audit-logs">
+  Now that decisions matter, record them all. Tamper-evident, append-only, queryable.
+</Card>

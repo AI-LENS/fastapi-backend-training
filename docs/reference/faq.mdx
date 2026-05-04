@@ -1,0 +1,37 @@
+---
+title: "FAQ"
+description: "Common questions about this training and FastAPI in general."
+---
+
+<AccordionGroup>
+  <Accordion title="Why FastAPI and not Flask or Django?">
+    FastAPI is type-driven, async-native, and ships with auto-generated OpenAPI docs and Pydantic validation. Flask is older and simpler but you end up gluing five libraries together to match what FastAPI gives you out of the box. Django REST Framework is great for full-stack monoliths but heavier than this training needs.
+  </Accordion>
+  <Accordion title="Do I need to know async Python before starting?">
+    No. Module 12 covers everything you need. Until then, treat `async def` and `await` as syntax to copy — we'll explain *why* later.
+  </Accordion>
+  <Accordion title="Why SQLite for training and Postgres for production?">
+    SQLite needs no setup — perfect for learning. The code we write works on both because SQLAlchemy abstracts the differences. Module 25 swaps in Postgres via Docker.
+  </Accordion>
+  <Accordion title="Why Pydantic v2 and not v1?">
+    Pydantic v2 is significantly faster (10-50×) and is the only version FastAPI 0.100+ supports. v1 is in maintenance mode.
+  </Accordion>
+  <Accordion title="Should I follow this training linearly?">
+    Yes for Modules 01-11 (foundations stack on each other) and the auth/worker chain (12-17, 22) — Module 23's integration tests assume both auth and the worker exist. After 23, Modules 18-26 can be reordered if you have a specific need (e.g., jump to logging if your day-job is observability-heavy). Modules 27-28 assume everything before.
+  </Accordion>
+  <Accordion title="How long does the whole thing take?">
+    25 hours of focused work for someone new to FastAPI. Spread over 2-4 weeks at a sane pace. Don't binge it — concepts need overnight to settle.
+  </Accordion>
+  <Accordion title="What if I get stuck on an exercise?">
+    Try for 10 minutes. Then check the hint tabs. Then check the solution. Then *type* the solution (don't copy-paste — typing forces understanding). If still stuck, ask me — say "stuck on Module N exercise" and paste your code.
+  </Accordion>
+  <Accordion title="Can I use this training as the basis for a real project?">
+    Yes. The code you'll have at Module 28 is genuinely production-shaped. You'd want to add: real Postgres (Module 25), proper secrets management (Vault/AWS Secrets Manager), CI/CD, alerting, and your own domain logic.
+  </Accordion>
+  <Accordion title="Why is the AnnotateHub codebase referenced everywhere?">
+    Because it's a real production FastAPI app with the *exact* same architecture this training teaches. Comparing your code against a working production codebase is the fastest way to develop taste.
+  </Accordion>
+  <Accordion title="What if I find a bug in the training?">
+    Tell me — we'll fix it together. The training will be wrong sometimes; finding it is also learning.
+  </Accordion>
+</AccordionGroup>

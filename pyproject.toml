@@ -1,0 +1,14 @@
+[project]
+name = "subject-enrollment-training"
+version = "0.1.0"
+description = "Student workspace — Subject Enrollment Service training. Add deps as you progress through modules."
+requires-python = ">=3.10"
+dependencies = [
+    # Module 01 starting point: just FastAPI + uvicorn.
+    # As later modules introduce features, add deps with `uv add ...`.
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+]
+
+[dependency-groups]
+dev = []

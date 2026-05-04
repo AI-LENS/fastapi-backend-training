@@ -1,0 +1,274 @@
+---
+title: "03 · Routers & params"
+description: "APIRouter, path/query/body parameters, status codes, response_model, tags."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~10 lines · **Outcome:** Endpoints split into focused router files. `main.py` shrinks back to ~15 lines.
+</Tip>
+
+## Concept
+
+`main.py` is starting to bloat. As we add screenings, sites, auth, jobs, we'd hit 1000 lines fast.
+
+**`APIRouter` is FastAPI's solution.** Each resource gets its own file with its own routes; `main.py` just *includes* them with a prefix.
+
+```
+app/
+├── main.py              ← creates app, includes routers
+└── routers/
+    ├── screenings.py    ← all /screenings endpoints
+    └── sites.py         ← all /sites endpoints
+```
+
+This is **the** structure used by every production FastAPI codebase.
+
+### Three kinds of parameters
+
+| Kind | Example | Where it lives |
+|---|---|---|
+| **Path** | `/screenings/{id}` | URL itself, always required |
+| **Query** | `?status=eligible&limit=50` | URL query string, usually optional |
+| **Body** | JSON object on POST/PUT | Request body, declared with a Pydantic schema |
+
+FastAPI infers which is which from your function signature: types in the URL = path, types in the function = query (unless they're a Pydantic model = body).
+
+## Walkthrough
+
+### Step 1 — Create router files
+
+<Note>
+  This step assumes `app/schemas/site.py` already exists with `SiteResponse`. You created that file in the **Module 02 exercise**. If you skipped it, do that exercise now (or paste this minimal stub):
+
+  ```python app/schemas/site.py
+  from pydantic import BaseModel
+
+  class SiteResponse(BaseModel):
+      id: str
+      name: str
+      active: bool
+
+      model_config = {"from_attributes": True}
+  ```
+</Note>
+
+```python app/routers/__init__.py
+# empty
+```
+
+```python app/routers/sites.py
+"""Site routes."""
+from fastapi import APIRouter, HTTPException
+
+from app.schemas.site import SiteResponse
+
+router = APIRouter(prefix="/sites", tags=["sites"])
+
+_SITES: list[SiteResponse] = [
+    SiteResponse(id="SITE-001", name="Mass General", active=True),
+    SiteResponse(id="SITE-002", name="Stanford Health", active=True),
+    SiteResponse(id="SITE-003", name="Old Site", active=False),
+]
+
+
+@router.get("", response_model=list[SiteResponse])
+def list_sites(active: bool | None = None):
+    """List sites. Filter by active status with `?active=true`."""
+    if active is None:
+        return _SITES
+    return [s for s in _SITES if s.active == active]
+
+
+@router.get("/{site_id}", response_model=SiteResponse)
+def get_site(site_id: str):
+    for site in _SITES:
+        if site.id == site_id:
+            return site
+    raise HTTPException(status_code=404, detail=f"Site {site_id} not found")
+```
+
+```python app/routers/screenings.py
+"""Screening routes."""
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, HTTPException
+
+from app.schemas.screening import ScreeningCreate, ScreeningResponse
+
+router = APIRouter(prefix="/screenings", tags=["screenings"])
+
+_screenings: dict[UUID, dict] = {}
+
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+def create_screening(payload: ScreeningCreate):
+    screening = {
+        "id": uuid4(),
+        "status": "submitted",
+        "created_at": datetime.utcnow(),
+        **payload.model_dump(),
+    }
+    _screenings[screening["id"]] = screening
+    return screening
+
+
+@router.get("", response_model=list[ScreeningResponse])
+def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+):
+    """List screenings, optionally filtered by site or status."""
+    items = list(_screenings.values())
+    if site_id:
+        items = [s for s in items if s["site_id"] == site_id]
+    if status:
+        items = [s for s in items if s["status"] == status]
+    return items[:limit]
+
+
+@router.get("/{screening_id}", response_model=ScreeningResponse)
+def get_screening(screening_id: UUID):
+    if screening_id not in _screenings:
+        raise HTTPException(status_code=404, detail="Screening not found")
+    return _screenings[screening_id]
+```
+
+### Step 2 — Slim down `main.py`
+
+```python app/main.py
+"""Subject Enrollment Service — entry point."""
+from fastapi import FastAPI
+
+from app.routers import screenings, sites
+
+app = FastAPI(title="Subject Enrollment Service", version="0.3.0")
+
+app.include_router(sites.router)
+app.include_router(screenings.router)
+
+
+@app.get("/")
+def root():
+    return {"service": "Subject Enrollment Service", "status": "ok"}
+```
+
+That's it. `main.py` is back to being scannable.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`APIRouter(prefix='/sites', tags=['sites'])`">
+    `prefix` is prepended to every route in this router (so `@router.get("")` becomes `GET /sites`). `tags` groups endpoints together in `/docs` — refresh and you'll see "sites" and "screenings" sections.
+  </Accordion>
+  <Accordion title="`active: bool | None = None`">
+    A **query parameter**. Because it has a default value and a primitive type, FastAPI knows it's a query param. URL: `/sites?active=true`. The type coercion is automatic — `?active=true` becomes Python `True`.
+  </Accordion>
+  <Accordion title="`screening_id: UUID`">
+    A **path parameter** (because `{screening_id}` is in the route string) typed as `UUID`. FastAPI parses the URL fragment as a UUID; if it's not valid UUID syntax, you get a 422 automatically.
+  </Accordion>
+  <Accordion title="`payload: ScreeningCreate`">
+    A **body parameter** (because the type is a Pydantic model). FastAPI knows this from the type alone.
+  </Accordion>
+  <Accordion title="`app.include_router(screenings.router)`">
+    Mounts the router into the app. You can also override the prefix here: `app.include_router(screenings.router, prefix="/api/v1")`. We'll do that in Module 04 for API versioning.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Refresh /docs">
+    You should now see two groups: **sites** and **screenings**, each with their endpoints.
+  </Step>
+  <Step title="List active sites only">
+    ```bash
+    curl 'http://localhost:8000/sites?active=true'
+    ```
+    Returns 2 sites.
+  </Step>
+  <Step title="List screenings filtered by site">
+    Submit one or two POST /screenings first, then:
+    ```bash
+    curl 'http://localhost:8000/screenings?site_id=SITE-001&limit=10'
+    ```
+  </Step>
+  <Step title="Try a bad UUID">
+    ```bash
+    curl http://localhost:8000/screenings/not-a-uuid
+    ```
+    422 with a clear error. You wrote zero parsing code.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What's the difference between `prefix` on the router vs on `include_router`?">
+    Both work. Prefer the **router** for "this resource lives at this URL" (`/sites`); use **include_router** for cross-cutting prefixes ("everything is under `/api/v1`"). Module 04 does both.
+  </Accordion>
+  <Accordion title="When should I use `tags`?">
+    Always. They organize `/docs`. Convention: one tag per resource, lowercase plural (`["sites"]`, `["screenings"]`).
+  </Accordion>
+  <Accordion title="Can I have multiple routers handle the same path?">
+    Technically yes, but don't. The first registered wins. Keep one router per resource.
+  </Accordion>
+  <Accordion title="What about `@router.delete` and `@router.put`?">
+    Same syntax as `get`/`post`. Conventions: `DELETE /screenings/{id}` for delete, `PUT /screenings/{id}` for full replace, `PATCH /screenings/{id}` for partial update.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a `DELETE /screenings/{screening_id}` endpoint.
+
+    Behavior:
+    - If the screening exists and `status == "submitted"`, remove it from `_screenings` and return 204 (no content).
+    - If it exists but status is anything else, return **409 Conflict** with detail `"Cannot delete screening in status X"`.
+    - If it doesn't exist, return 404.
+
+    The DELETE route should NOT have a response model (use `status_code=204` and return `None`).
+  </Tab>
+  <Tab title="Hint">
+    Use `status_code=204`. For 204, return `None` from the function (FastAPI sends an empty body). For 409, raise `HTTPException(409, "...")`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/03-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+# Create a screening
+SID=$(curl -sX POST http://localhost:8000/screenings \
+  -H "Content-Type: application/json" \
+  -d '{"site_id":"SITE-001","candidate_initials":"AB","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["metformin"]}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+
+# Delete it
+curl -i -X DELETE http://localhost:8000/screenings/$SID
+# Expect: HTTP/1.1 204 No Content
+
+# Delete again — should be 404
+curl -i -X DELETE http://localhost:8000/screenings/$SID
+# Expect: HTTP/1.1 404 Not Found
+```
+
+## Insight
+
+<Tip>
+  **Notice how the router file reads like a table of contents for the resource.** Anyone landing in `app/routers/screenings.py` immediately sees: I can create, list, get one, delete. The router is documentation as much as code.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/routers/jobs.py` — same pattern, more endpoints (cancel, stage-stop, downloads).
+
+## Next module
+
+<Card title="Module 04: Project structure" icon="folder" href="/modules/04-project-structure">
+  Move to the canonical layout: `create_app()` factory, `lifespan`, `pydantic-settings`, `app.state`. After this module, your project looks like a real one.
+</Card>

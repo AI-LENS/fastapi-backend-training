@@ -1,0 +1,118 @@
+---
+title: "Architecture reference"
+description: "The layered architecture, in one page. Bookmark this."
+---
+
+The single picture every backend architectural concept in this training maps to.
+
+## The layered model
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                          Client                                 │
+│              (browser, curl, Swagger UI, frontend)              │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ HTTP
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Middleware     CORS · Request ID · Logging · Rate-limit        │
+├─────────────────────────────────────────────────────────────────┤
+│  Routers        @app.get / @router.post — thin handlers         │
+│                 Validate input, call service, return response   │
+├─────────────────────────────────────────────────────────────────┤
+│  Schemas        Pydantic — request/response contracts           │
+├─────────────────────────────────────────────────────────────────┤
+│  Services       Business logic & decisions                      │
+│                 "If eligible, mark enrolled, assign subject ID" │
+├─────────────────────────────────────────────────────────────────┤
+│  Repositories   Data access — only place that touches the ORM   │
+├─────────────────────────────────────────────────────────────────┤
+│  Models         SQLAlchemy — table definitions                  │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+                       ┌──────────┐
+                       │ Database │
+                       └──────────┘
+
+  ──── async background flow ────
+
+  Service ──► Worker ──► Pipeline ──► (writes results back via Repository)
+```
+
+## Layer responsibilities (one rule per layer)
+
+| Layer | Owns | Never does |
+|---|---|---|
+| **Router** | Request/response, status codes | Business decisions |
+| **Schema** | Validation, contract | Logic, DB |
+| **Service** | Decisions, orchestration | Raw SQL, HTTP |
+| **Repository** | DB queries | Decisions |
+| **Worker** | Background execution | Decisions (delegates to service/pipeline) |
+| **Pipeline** | Pure processing | Side effects (DB / HTTP) |
+| **Model** | Schema definition | Logic |
+
+## Cross-cutting layers
+
+These don't fit the stack — they wrap or feed it:
+
+| Concern | Where it lives | Module |
+|---|---|---|
+| Authentication | `dependencies.py` (`get_current_user`) | 16 |
+| Authorization | `dependencies.py` (`require_role`) | 17 |
+| Configuration | `config.py` (`pydantic-settings`) | 04, 24 |
+| Database session | `database.py` (yield-based dep) | 05 |
+| Error handling | `exceptions.py` + `@exception_handler` | 11 |
+| Logging | `logging_config.py` | 20 |
+| Metrics | `/metrics` endpoint | 21 |
+
+## Three "thinking shortcuts" for layer placement
+
+<CardGroup cols={3}>
+  <Card title="If it touches the DB" icon="database">
+    It's a **repository**.
+  </Card>
+  <Card title="If it makes a decision" icon="puzzle-piece">
+    It's a **service**.
+  </Card>
+  <Card title="If it processes data" icon="gear">
+    It's a **pipeline stage**.
+  </Card>
+</CardGroup>
+
+## Request lifecycle (annotated)
+
+```
+1. HTTP request arrives at uvicorn
+2. Middleware chain runs (CORS, logging, rate-limit)
+3. Router matches the URL → handler picked
+4. Dependencies resolved (get_db, get_current_user, ...)
+5. Schema validates the request body (422 if bad)
+6. Handler calls service.do_thing(...)
+7. Service makes decisions, calls repos
+8. Repos run SQLAlchemy queries
+9. Service returns a model object
+10. Handler returns it; FastAPI serializes via response_model
+11. Middleware chain (in reverse) wraps the response
+12. uvicorn sends bytes back
+```
+
+## Common mistakes (from the original outline)
+
+<Warning>
+  - **Logic in routers** — `if study.type == "A": run_pipeline()` belongs in a service.
+  - **Heavy processing in services** — file parsing, ML inference, transformations belong in pipelines.
+  - **DB queries in services** — every `session.execute(...)` belongs in a repo.
+  - **Pipeline stages with side effects** — pipelines write to the DB through callbacks/results, not directly. Keeps them testable.
+</Warning>
+
+## See also
+
+<CardGroup cols={2}>
+  <Card title="Glossary" icon="book" href="/reference/glossary">
+    Domain and tech terms.
+  </Card>
+  <Card title="Cheatsheet" icon="terminal" href="/reference/cheatsheet">
+    Commands and snippets you'll use repeatedly.
+  </Card>
+</CardGroup>

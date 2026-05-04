@@ -1,0 +1,245 @@
+---
+title: "05 · SQLAlchemy intro"
+description: "Engine, sessions, sync vs async — and why production FastAPI goes async."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~10 lines · **Outcome:** Real SQLite database wired up async, with a `get_db` dependency every router can use.
+</Tip>
+
+## Concept
+
+In-memory dicts have served us well, but they vanish on restart and don't survive multiple workers. Time for a real database.
+
+### Two SQLAlchemy concepts you must internalize
+
+<CardGroup cols={2}>
+  <Card title="Engine" icon="server">
+    The connection pool. Long-lived (one per app). Holds open connections to the DB so each request doesn't pay the connection-handshake cost.
+  </Card>
+  <Card title="Session" icon="link">
+    A unit of work. Short-lived (one per request). Holds your in-progress objects and queries until you `commit()` or `rollback()`.
+  </Card>
+</CardGroup>
+
+```
+Engine (lives forever) ──► many Sessions (one per request) ──► many queries
+```
+
+### Sync vs async — why we go async
+
+| | Sync session | Async session |
+|---|---|---|
+| Driver | `sqlite`, `psycopg2` | `aiosqlite`, `asyncpg` |
+| API | `session.execute(...)` | `await session.execute(...)` |
+| Blocks event loop | Yes | No |
+| Used by | Older Flask, scripts | Production FastAPI |
+
+A blocking `session.execute()` inside an `async def` route freezes the entire event loop while the DB query runs. With 50 concurrent requests, your server is unresponsive. Async fixes this.
+
+We'll use **SQLite** (zero setup) with the **`aiosqlite`** async driver. Same code works on PostgreSQL by changing one line (Module 25).
+
+## Walkthrough
+
+### Step 1 — Install async dependencies
+
+```bash
+uv add "sqlalchemy[asyncio]>=2.0" aiosqlite
+```
+
+### Step 2 — Add the database URL to settings
+
+```python app/config.py {16-17}
+class Settings(BaseSettings):
+    # ...existing...
+
+    # Database
+    db_url: str = "sqlite+aiosqlite:///./enrollment.db"
+```
+
+### Step 3 — Create `app/database.py`
+
+```python app/database.py
+"""Async SQLAlchemy setup — engine, session factory, get_db dependency."""
+from collections.abc import AsyncGenerator
+
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from app.config import settings
+
+
+# The engine — one for the whole app's lifetime.
+engine = create_async_engine(
+    settings.db_url,
+    echo=False,            # set True to see every SQL statement (Module 06 demo)
+    pool_pre_ping=True,    # checks connection liveness before use
+)
+
+# Session factory — call it to get a fresh session.
+async_session = async_sessionmaker(
+    engine,
+    expire_on_commit=False,  # keeps objects usable after commit (FastAPI-friendly)
+)
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency: yield a session, ensure it closes."""
+    async with async_session() as session:
+        yield session
+
+
+async def close_db() -> None:
+    """Dispose engine on shutdown."""
+    await engine.dispose()
+```
+
+### Step 4 — Wire engine into lifespan
+
+```python app/main.py {3, 14-21}
+# imports
+from app.database import close_db
+
+# inside lifespan
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting %s v%s", settings.app_name, settings.app_version)
+    yield
+    logger.info("Shutting down")
+    await close_db()
+```
+
+### Step 5 — Smoke-test the connection
+
+Add a temporary check in lifespan to confirm the engine works (we'll remove it after Module 06):
+
+```python app/main.py
+from sqlalchemy import text
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.execute(text("SELECT 1"))
+    logger.info("DB connection OK")
+    yield
+    await close_db()
+```
+
+(You'll need to import `engine` and `text` from `app.database` and `sqlalchemy`.)
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`async_sessionmaker(...)`">
+    A factory function. Calling it (`async_session()`) gives you a fresh session. The factory is configured once with engine settings; each session inherits them.
+  </Accordion>
+  <Accordion title="`expire_on_commit=False`">
+    SQLAlchemy normally invalidates objects after `commit()`, requiring a re-query to access them. That's bad for FastAPI: you'd lose the object you want to return. Setting this to `False` keeps objects readable post-commit. Standard for web apps.
+  </Accordion>
+  <Accordion title="`async with async_session() as session: yield session`">
+    The yield-based dependency pattern. FastAPI runs everything before `yield`, hands the session to your route, then runs everything after `yield` (the implicit `__aexit__` closes the session). You never leak a session.
+  </Accordion>
+  <Accordion title="`pool_pre_ping=True`">
+    Before SQLAlchemy hands you a pooled connection, it sends a no-op ping to detect stale connections (e.g., killed by a firewall). Cheap insurance. Always on in production.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart Uvicorn">
+    You should see `DB connection OK` in the logs (and a new `enrollment.db` file appears).
+  </Step>
+  <Step title="Examine the DB">
+    ```bash
+    ls -la enrollment.db
+    sqlite3 enrollment.db ".tables"
+    ```
+    No tables yet — that's Module 06.
+  </Step>
+  <Step title="Set echo=True briefly">
+    In `database.py`, set `echo=True`, restart, and observe the `SELECT 1` you wrote in the smoke test logged out. Then turn it back off.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Why a yield-based dep instead of `Depends(async_session)`?">
+    Calling `async_session()` returns a context manager, not a session. The yield pattern enters the context, hands you the session, then exits cleanly. Without it, sessions leak.
+  </Accordion>
+  <Accordion title="Can I use a sync session in an `async def` route?">
+    Technically yes, with `asyncio.to_thread`. Don't. It defeats the purpose of async. Pick async sessions and stick with them.
+  </Accordion>
+  <Accordion title="What does `pool_size` control?">
+    The number of idle connections kept in the pool. Default is 5. Production tuning: roughly equals your worker count × concurrent DB-bound requests per worker. Postgres has its own server-side `max_connections` limit you must not exceed.
+  </Accordion>
+  <Accordion title="Why SQLite for training and Postgres for prod?">
+    SQLite needs zero setup but doesn't handle high write concurrency. Async SQLAlchemy abstracts the difference; the only line that changes is the `db_url`. Module 25 swaps in Postgres via Docker.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a route that confirms the DB is reachable:
+
+    `GET /health/db` — returns `{"db": "ok"}` on success or 503 with `{"db": "unreachable"}` on failure.
+
+    Use `Depends(get_db)` to inject the session. Use `await db.execute(text("SELECT 1"))` to ping the DB.
+
+    You'll write ~10 lines. Add this to `main.py` (we'll move it to a router in a later refactor).
+  </Tab>
+  <Tab title="Hint 1">
+    Imports you need: `Depends`, `HTTPException`, `text`, `AsyncSession`, `get_db`. Wrap the execute in `try/except SQLAlchemyError`.
+  </Tab>
+  <Tab title="Hint 2">
+    ```python
+    from sqlalchemy.exc import SQLAlchemyError
+
+    @app.get("/health/db")
+    async def health_db(db: AsyncSession = Depends(get_db)):
+        try:
+            await db.execute(text("SELECT 1"))
+            return {"db": "ok"}
+        except SQLAlchemyError:
+            raise HTTPException(503, detail={"db": "unreachable"})
+    ```
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/05-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+curl -i http://localhost:8000/health/db
+# HTTP/1.1 200 OK
+# {"db":"ok"}
+
+# To simulate failure: rename enrollment.db while server runs, hit endpoint
+mv enrollment.db enrollment.db.bak
+curl -i http://localhost:8000/health/db
+# HTTP/1.1 503
+mv enrollment.db.bak enrollment.db
+```
+
+## Insight
+
+<Tip>
+  **The session is request-scoped — but the engine is app-scoped.** Mixing those up causes the most common DB bugs: a single shared session across requests (data corruption) or a new engine per request (connection-pool starvation). The pattern in `database.py` is non-negotiable: one engine, fresh session per request.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/database.py` — same shape, asyncpg instead of aiosqlite. 27 lines that the entire app rests on.
+
+## Next module
+
+<Card title="Module 06: Models" icon="database" href="/modules/06-models">
+  Define the `Screening` and `Site` tables in code. Columns, indexes, timestamps, relationships.
+</Card>

@@ -1,0 +1,335 @@
+---
+title: "26 · Deployment"
+description: "Health probes, gunicorn workers, graceful shutdown, deployment patterns."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~25 lines · **Outcome:** Liveness/readiness/startup probes wired up. Multi-worker process model. Graceful shutdown that drains in-flight requests.
+</Tip>
+
+## Concept
+
+Running `uvicorn app.main:app --reload` is great for dev. Production needs more:
+
+<CardGroup cols={3}>
+  <Card title="Multiple workers" icon="server">
+    A single uvicorn process is single-CPU. Production uses one process per CPU (or more).
+  </Card>
+  <Card title="Health probes" icon="shield">
+    Orchestrators (k8s, ECS, Cloud Run) need to know "is this instance alive?" and "is it ready for traffic?" — different questions.
+  </Card>
+  <Card title="Graceful shutdown" icon="rocket">
+    On rolling deploys, in-flight requests must complete; the worker exits cleanly. Otherwise users see 502s.
+  </Card>
+</CardGroup>
+
+### Three kinds of probe
+
+| Probe | Question | If it fails |
+|---|---|---|
+| **Liveness** | "Is the process alive?" | Restart the container |
+| **Readiness** | "Is it ready to serve requests?" | Take it out of the load balancer |
+| **Startup** | "Is it still initializing?" | Wait before applying liveness/readiness |
+
+Confusing them is a classic outage cause. Liveness check that hits the DB → DB hiccups → all containers restart → cascading failure.
+
+## Walkthrough
+
+### Step 1 — Three health endpoints
+
+```python app/routers/health.py
+"""Health endpoints for orchestrator probes."""
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Response
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.dependencies import get_db_session
+
+router = APIRouter(tags=["ops"])
+logger = logging.getLogger(__name__)
+
+# A flag flipped by lifespan. True iff startup completed successfully.
+_app_ready = False
+
+
+def set_ready(ready: bool) -> None:
+    global _app_ready
+    _app_ready = ready
+
+
+@router.get("/health/live", include_in_schema=False)
+async def liveness():
+    """Liveness: is the process alive? Cheapest possible check."""
+    return {"status": "alive"}
+
+
+@router.get("/health/ready", include_in_schema=False)
+async def readiness(db: AsyncSession = Depends(get_db_session)):
+    """Readiness: can we accept traffic? Verifies DB connectivity."""
+    if not _app_ready:
+        raise HTTPException(503, detail={"status": "starting"})
+    try:
+        await db.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        logger.warning("Readiness DB check failed: %s", exc)
+        raise HTTPException(503, detail={"status": "db_unreachable"})
+    return {"status": "ready"}
+
+
+@router.get("/health/startup", include_in_schema=False)
+async def startup_probe():
+    """Startup: are we done initializing? Returns 200 once lifespan completes."""
+    if _app_ready:
+        return {"status": "ready"}
+    raise HTTPException(503, detail={"status": "starting"})
+
+
+# The simple `/health` from earlier is kept as an alias for liveness
+@router.get("/health", include_in_schema=False)
+async def simple_health():
+    return {"status": "ok"}
+```
+
+Wire `set_ready(True)` at the end of `lifespan` and `set_ready(False)` at shutdown. This is a partial diff — keep the existing migration / seed / engine init / task-runner setup from earlier modules; just add the readiness flips:
+
+```python app/main.py
+from app.routers.health import set_ready
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... existing startup: migrations (Module 07), _seed_users (Module 17),
+    # task runner init (Module 13), etc. ...
+    set_ready(True)
+    logger.info("App ready")
+    yield
+    set_ready(False)
+    logger.info("App shutting down")
+    # ... existing shutdown: close DB, cancel tasks ...
+```
+
+### Step 2 — Gunicorn for multi-worker production
+
+Uvicorn alone runs one worker. For production, use **gunicorn** as a process manager driving uvicorn workers:
+
+```bash
+uv add gunicorn
+```
+
+```python app/gunicorn_conf.py
+"""Gunicorn configuration."""
+import multiprocessing
+
+# Bind
+bind = "0.0.0.0:8000"
+
+# Worker tuning
+workers = multiprocessing.cpu_count() * 2 + 1   # standard formula for I/O-bound
+worker_class = "uvicorn.workers.UvicornWorker"
+worker_connections = 1000
+
+# Timeouts
+timeout = 60          # per-request hard timeout
+graceful_timeout = 30 # how long to wait for workers to finish
+
+# Lifecycle
+max_requests = 1000          # restart workers periodically (memory leak guard)
+max_requests_jitter = 100    # stagger restarts so they don't sync
+
+# Logging
+accesslog = "-"  # stdout
+errorlog = "-"
+loglevel = "info"
+
+# Process names (for `ps`)
+proc_name = "enrollment-api"
+```
+
+Update the Dockerfile CMD:
+
+```dockerfile Dockerfile
+CMD ["gunicorn", "-c", "app/gunicorn_conf.py", "app.main:app"]
+```
+
+### Step 3 — Graceful shutdown
+
+When the container receives SIGTERM (during a deploy), gunicorn signals workers, which:
+
+1. Stop accepting new connections
+2. Finish in-flight requests
+3. Run lifespan shutdown (closes DB, cancels tasks)
+4. Exit
+
+We've already implemented (3) — the `lifespan` `finally` blocks close `engine.dispose()` and cancel tasks. Verify it works:
+
+```python app/main.py
+# Keep the import you added in Step 1 / Module 05.
+from app.database import close_db
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    set_ready(True)
+    yield
+    set_ready(False)
+
+    logger.info("Cancelling background tasks")
+    if hasattr(app.state, "task_runner"):
+        # `shutdown(timeout=...)` is part of the production worker (Module 13b).
+        # If you're still on the Module 13 runner, call `shutdown()` without a kwarg.
+        await app.state.task_runner.shutdown(timeout=20.0)
+
+    logger.info("Closing DB engine")
+    await close_db()
+
+    logger.info("Shutdown complete")
+```
+
+The `set_ready(False)` line is critical: as soon as it flips, the readiness probe returns 503, and the load balancer stops sending new traffic. In-flight requests finish; the process exits cleanly.
+
+### Step 4 — Configure orchestrator probes
+
+In Kubernetes:
+
+```yaml k8s-deployment.yaml
+spec:
+  containers:
+  - name: api
+    image: enrollment:latest
+    livenessProbe:
+      httpGet:
+        path: /health/live
+        port: 8000
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    readinessProbe:
+      httpGet:
+        path: /health/ready
+        port: 8000
+      initialDelaySeconds: 10
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 2
+    startupProbe:
+      httpGet:
+        path: /health/startup
+        port: 8000
+      periodSeconds: 5
+      failureThreshold: 60   # allow up to 5 minutes startup
+```
+
+Same idea on AWS ECS, Cloud Run — different YAML, same concepts.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why is liveness shallow?">
+    A liveness check that hits the DB will fail every time the DB has a hiccup. Result: all containers restart simultaneously, no DB to talk to, infinite restart loop. Liveness should only verify "the Python process is responsive" — heavier checks belong in readiness.
+  </Accordion>
+  <Accordion title="`workers = CPUs × 2 + 1`">
+    Gunicorn's recommended formula for I/O-bound workloads. For pure CPU-bound, use `workers = CPUs`. For mixed (most FastAPI), the formula is fine. Tune based on actual load testing (Module 22b).
+  </Accordion>
+  <Accordion title="`max_requests = 1000` — what's that?">
+    Each worker handles 1000 requests then restarts. Defends against memory leaks (yours or in deps). The `_jitter` prevents all workers from restarting at the same time.
+  </Accordion>
+  <Accordion title="What if I have shared state in `app.state`?">
+    Each gunicorn worker is a separate process — they don't share state. The `task_runner` exists per-worker. For shared state, you need an external store (Redis, DB). Module 28 covers this for the worker queue.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Test the probes">
+    ```bash
+    curl http://localhost:8000/health/live
+    # {"status":"alive"}
+    curl http://localhost:8000/health/ready
+    # {"status":"ready"}
+    curl http://localhost:8000/health/startup
+    # {"status":"ready"}
+    ```
+  </Step>
+  <Step title="Simulate DB outage">
+    ```bash
+    docker compose stop postgres
+    sleep 2
+    curl -i http://localhost:8000/health/live
+    # 200 — process is alive
+    curl -i http://localhost:8000/health/ready
+    # 503 — DB unreachable, take out of LB
+    docker compose start postgres
+    ```
+  </Step>
+  <Step title="Run with gunicorn locally">
+    ```bash
+    gunicorn -c app/gunicorn_conf.py app.main:app
+    ```
+    Multi-worker. Traffic distributes round-robin across workers.
+  </Step>
+  <Step title="SIGTERM test">
+    Send SIGTERM to the gunicorn process and observe shutdown logs:
+    ```bash
+    kill -TERM <pid>
+    ```
+    Should see "Cancelling background tasks", "Closing DB engine", "Shutdown complete" in order.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="My readiness probe is failing during startup but the app eventually starts.">
+    That's why startup probe exists. With it, k8s waits for `/health/startup` to return 200 before applying liveness/readiness. Without it, liveness might kill the container during slow startup.
+  </Accordion>
+  <Accordion title="Should auth required for health endpoints?">
+    Liveness/readiness/startup: no — orchestrators don't carry auth. Restrict at the network level (ingress rules don't expose them externally).
+  </Accordion>
+  <Accordion title="What's the right `graceful_timeout`?">
+    Long enough for the longest reasonable in-flight request to complete. 30s is common; if you have streaming or long polls, raise to ~60s. Too long: deploys get slow. Too short: in-flight requests get killed.
+  </Accordion>
+  <Accordion title="What's wrong with `--reload` in prod?">
+    File-watching overhead, no multi-worker, weird behaviors under load. Strict dev-only flag.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add an **active background-tasks count** to the readiness check. If more than 100 tasks are queued/running, return 503 — the load balancer should stop sending new traffic until things drain.
+
+    1. Add a method `BackgroundTaskRunner.active_count() -> int`.
+    2. Inject the runner into the readiness route via `Depends(get_task_runner)`.
+    3. If `runner.active_count() > 100`, return 503 with `{"status":"saturated"}`.
+
+    This is **back-pressure**: the API tells the load balancer "I'm full, route elsewhere".
+  </Tab>
+  <Tab title="Hint">
+    `len([t for t in self._tasks.values() if not t.done()])` — same logic as the gauge in Module 21.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/26-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The discipline of three probes is what makes auto-healing work.** The orchestrator restarts unhealthy pods (liveness), routes traffic away from temporarily-overloaded ones (readiness), and waits for slow starters (startup). The patterns we built in this module are what convert "the API runs" into "the API self-manages under load and during deploys".
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/docker-compose.yml` and `deploy/` — the production setup. Note the migration-on-startup pattern, healthchecks, and volume mounts.
+
+## Next module
+
+<Card title="Module 26b: CI/CD" icon="rocket" href="/modules/26b-cicd">
+  GitHub Actions: test → build → migrate → deploy.
+</Card>

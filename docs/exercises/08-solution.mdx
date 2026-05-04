@@ -1,0 +1,99 @@
+---
+title: "08 · Solution"
+description: "Site repository + clean sites router."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Files
+
+```python app/repositories/site_repository.py
+"""Database access for Sites."""
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.site import Site
+
+
+async def list_all(db: AsyncSession, *, active: bool | None = None) -> list[Site]:
+    stmt = select(Site).order_by(Site.id)
+    if active is not None:
+        stmt = stmt.where(Site.active == active)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def get_by_id(db: AsyncSession, site_id: str) -> Site | None:
+    return await db.get(Site, site_id)
+
+
+async def seed(db: AsyncSession, sites: list[Site]) -> int:
+    """Insert sites if the table is empty. Returns count inserted."""
+    result = await db.execute(select(Site).limit(1))
+    if result.scalars().first() is not None:
+        return 0
+    db.add_all(sites)
+    await db.commit()
+    return len(sites)
+```
+
+```python app/routers/sites.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.repositories import site_repository as repo
+from app.schemas.site import SiteResponse
+
+router = APIRouter(prefix="/sites", tags=["sites"])
+
+
+@router.get("", response_model=list[SiteResponse])
+async def list_sites(active: bool | None = None, db: AsyncSession = Depends(get_db)):
+    return await repo.list_all(db, active=active)
+
+
+@router.get("/{site_id}", response_model=SiteResponse)
+async def get_site(site_id: str, db: AsyncSession = Depends(get_db)):
+    site = await repo.get_by_id(db, site_id)
+    if site is None:
+        raise HTTPException(404, detail=f"Site {site_id} not found")
+    return site
+```
+
+```python app/main.py
+from app.repositories import site_repository
+from app.models.site import Site
+
+DEFAULT_SITES = [
+    Site(id="SITE-001", name="Mass General", active=True),
+    Site(id="SITE-002", name="Stanford Health", active=True),
+    Site(id="SITE-003", name="Old Site", active=False),
+]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... migrations ...
+    async with async_session() as db:
+        inserted = await site_repository.seed(db, DEFAULT_SITES)
+        if inserted:
+            logger.info("Seeded %d sites", inserted)
+    yield
+    await close_db()
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why `seed` returns a count?">
+    Lets the caller log what happened. Repo functions stay terse; logging concerns belong to callers.
+  </Accordion>
+  <Accordion title="`select(Site).limit(1)` for emptiness check?">
+    Slightly faster than `select(Site)` then checking `first()` — DB stops after one row.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 09: Service layer" icon="puzzle-piece" href="/modules/09-service-layer" />

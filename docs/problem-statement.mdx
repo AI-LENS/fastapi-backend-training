@@ -1,0 +1,174 @@
+---
+title: "Problem Statement"
+description: "What we're building, the entities, and the eligibility rules."
+---
+
+## In one paragraph
+
+A **site coordinator** submits a candidate's screening info through the API. The system runs **eligibility checks in the background** (demographics → medical history → inclusion criteria → exclusion criteria) and stores the result. If eligible, the coordinator can **enroll** the subject and they get a generated **subject ID**. Coordinators see only their own site's screenings; **sponsors** can see all sites.
+
+That's the product. Every module adds one architectural piece to this base.
+
+## Glossary (for non-clinical readers)
+
+| Term | Meaning |
+|---|---|
+| **Site** | A hospital or clinic running the trial |
+| **Coordinator** | Site staff who enters subject data |
+| **Sponsor** | The pharma/organization running the trial |
+| **Screening** | Checking if a candidate qualifies for the trial |
+| **Subject** | A person enrolled in the trial; gets a unique ID like `S-001` |
+| **Inclusion criteria** | Conditions you MUST meet to join |
+| **Exclusion criteria** | Conditions that DISQUALIFY you |
+
+## State machine
+
+```
+            [POST /screenings]
+                    │
+                    ▼
+              ┌──────────┐
+              │ submitted│  ← new, awaiting review
+              └────┬─────┘
+                   │ worker picks it up
+                   ▼
+              ┌──────────┐
+              │ reviewing│  ← pipeline running
+              └────┬─────┘
+            ┌──────┴──────┐
+   pass all │             │ fail any
+            ▼             ▼
+       ┌─────────┐   ┌────────────┐
+       │ eligible│   │ ineligible │  ← terminal: criteria explained
+       └────┬────┘   └────────────┘
+            │ POST /screenings/{id}/enroll
+            ▼
+       ┌─────────┐
+       │ enrolled│  ← terminal: subject_id assigned
+       └─────────┘
+```
+
+## Entities
+
+<Tabs>
+  <Tab title="Screening">
+    | Field | Type | Notes |
+    |---|---|---|
+    | `id` | UUID | Primary key |
+    | `site_id` | string | Submitting site |
+    | `candidate_initials` | string | e.g. `"JD"` (no PII) |
+    | `age` | int | |
+    | `sex` | enum: `M`, `F` | |
+    | `diagnosis` | string | |
+    | `medications` | list[string] | Current meds |
+    | `is_pregnant` | bool | |
+    | `has_liver_disease` | bool | |
+    | `in_other_trial` | bool | |
+    | `status` | enum | See state machine |
+    | `eligibility_result` | enum: `eligible`, `ineligible`, null | After review |
+    | `failed_criteria` | list[string] | Rules that failed |
+    | `subject_id` | string \| null | Set after enrollment |
+    | `created_at` | datetime | |
+    | `updated_at` | datetime | |
+  </Tab>
+  <Tab title="User">
+    | Field | Type | Notes |
+    |---|---|---|
+    | `id` | UUID | |
+    | `email` | string | Login |
+    | `hashed_password` | string | bcrypt |
+    | `role` | enum: `coordinator`, `sponsor` | |
+    | `site_id` | string \| null | Coordinators only |
+  </Tab>
+  <Tab title="Site (read-only)">
+    | Field | Type | Notes |
+    |---|---|---|
+    | `id` | string | e.g. `SITE-001` |
+    | `name` | string | e.g. `"Mass General"` |
+    | `active` | bool | |
+  </Tab>
+</Tabs>
+
+## Eligibility rules
+
+Kept dead simple so we can focus on architecture, not medicine.
+
+<AccordionGroup>
+  <Accordion title="INCLUDE rules — all must pass">
+    - `age >= 18 AND age <= 75`
+    - `diagnosis == "Type 2 Diabetes"`
+    - `len(medications) >= 1` (on stable medication)
+  </Accordion>
+  <Accordion title="EXCLUDE rules — any one disqualifies">
+    - `is_pregnant`
+    - `has_liver_disease`
+    - `in_other_trial`
+  </Accordion>
+  <Accordion title="Why split them into a pipeline?">
+    Each rule is independent, the order matters (cheap checks first), and rules change often (regulatory updates, protocol amendments). A pipeline isolates each rule so changes don't ripple. Module 14 builds this.
+  </Accordion>
+</AccordionGroup>
+
+A screening is `eligible` only when **ALL** include rules pass AND **NO** exclude rules trigger.
+
+## API surface (final shape)
+
+These are the endpoints we end up with after Module 17. They're added gradually.
+
+```
+# Public
+GET  /                              → service banner
+GET  /health                        → liveness probe
+
+# Auth (Module 16)
+POST /auth/login                    → email + password → JWT
+POST /auth/refresh                  → refresh token
+
+# Screenings
+POST   /screenings                  → submit (coordinator)
+GET    /screenings                  → list mine (coordinator) or all (sponsor)
+GET    /screenings/{id}             → fetch one
+GET    /screenings/{id}/progress    → SSE pipeline progress
+POST   /screenings/{id}/enroll      → enroll (only if eligible)
+DELETE /screenings/{id}             → cancel pending
+
+# Sites (sponsor view)
+GET /sites                          → list sites
+GET /sites/{site_id}/screenings     → site screenings
+```
+
+## Out of scope
+
+<Warning>
+  This is a training app, not a regulated system. The following are **explicitly out of scope** so we don't drift:
+  - Real medical or regulatory logic — invented rules only
+  - CDISC / SDTM / EDC integration — see the AnnotateHub project
+  - PII (we use initials and synthetic fields)
+  - Multi-trial / multi-protocol
+  - Frontend (we use Swagger UI + curl)
+</Warning>
+
+## Success criteria
+
+After Module 28, you should be able to:
+
+<CardGroup cols={2}>
+  <Card title="Read any FastAPI codebase" icon="book">
+    Locate routers, services, repos, models, schemas, workers, pipelines without help.
+  </Card>
+  <Card title="Explain layer boundaries" icon="puzzle-piece">
+    Say why each layer exists and what doesn't belong in it.
+  </Card>
+  <Card title="Add a feature end-to-end" icon="rocket">
+    Route → schema → service → repo → migration → test.
+  </Card>
+  <Card title="Trace a request" icon="chart-bar">
+    HTTP arrival → DB write → response, with timing and logs.
+  </Card>
+</CardGroup>
+
+## Next
+
+<Card title="Learning path" icon="map" href="/learning-path">
+  See all 36 modules.
+</Card>

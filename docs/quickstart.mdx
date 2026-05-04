@@ -1,0 +1,151 @@
+---
+title: "Quickstart"
+description: "Get the training environment running in 5 minutes."
+---
+
+This project uses [**uv**](https://docs.astral.sh/uv/) — Astral's fast Python package manager. One tool installs Python, manages the venv, and resolves dependencies.
+
+## Prerequisites
+
+| Tool | Version | Check with |
+|---|---|---|
+| uv | 0.5+ | `uv --version` |
+| Node.js (for Mintlify CLI) | 18+ | `node --version` |
+| A terminal | any | — |
+| An editor (VS Code, Cursor, etc.) | — | — |
+
+<Note>
+  If you don't have uv yet, install it once:
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  # or: brew install uv  (macOS)
+  ```
+  uv installs Python itself if you don't have it — no separate `python` install needed.
+</Note>
+
+## Set up your workspace (build-from-scratch path)
+
+<Steps>
+  <Step title="Open the training folder">
+    ```bash
+    cd /Users/chaitanyapradeeprepaka/Desktop/Training/backend
+    ```
+  </Step>
+  <Step title="Initialize a uv project">
+    From the `app/` folder up — actually we already have a `pyproject.toml` ready. Just install:
+
+    ```bash
+    uv sync
+    ```
+
+    `uv sync` reads `pyproject.toml`, creates a `.venv`, and installs everything into it. No manual venv creation, no `pip install`.
+  </Step>
+  <Step title="Start the API server">
+    ```bash
+    uv run uvicorn app.main:app --reload --port 8000
+    ```
+
+    `uv run` finds the project's venv automatically — **no activation needed**. `--reload` restarts on file save.
+  </Step>
+  <Step title="Verify the API">
+    Open in your browser:
+    - [http://localhost:8000/](http://localhost:8000/) → JSON banner
+    - [http://localhost:8000/docs](http://localhost:8000/docs) → interactive Swagger UI
+    - [http://localhost:8000/redoc](http://localhost:8000/redoc) → alternative docs
+
+    If you see JSON and Swagger, you're good.
+  </Step>
+</Steps>
+
+## See the working reference (run-it-first path)
+
+The complete working app lives in `final-app/`. Run it to see the goal state:
+
+```bash
+cd final-app
+uv sync --group dev
+ENROLLMENT_SECRET_KEY=$(openssl rand -hex 32) uv run uvicorn app.main:app --port 8000
+# → http://localhost:8000/docs
+
+# In another terminal, run all tests
+cd final-app
+uv run pytest tests/ -v
+# 44 tests pass
+```
+
+Default users are seeded on first start:
+- `admin@example.com` / `admin` (sponsor)
+- `alice@example.com` / `alice` (coordinator @ SITE-001)
+- `bob@example.com` / `bob` (coordinator @ SITE-002)
+
+## Run this docs site locally
+
+<Steps>
+  <Step title="Install Mintlify CLI">
+    ```bash
+    npm i -g mintlify
+    ```
+  </Step>
+  <Step title="Start the docs server">
+    From inside `docs/`:
+
+    ```bash
+    cd docs
+    mintlify dev
+    ```
+
+    Open [http://localhost:3000](http://localhost:3000). The docs reload as you edit `.mdx` files.
+  </Step>
+</Steps>
+
+## Two terminals = best workflow
+
+<Tip>
+  Keep two terminal tabs open while you work:
+  - **Tab 1:** the API server (`uv run uvicorn app.main:app --reload`)
+  - **Tab 2:** anything else (running tests, curl, git…)
+
+  This way you always see API logs in one place.
+</Tip>
+
+## Adding new dependencies
+
+As modules introduce new packages, you add them with `uv add`:
+
+```bash
+uv add pydantic-settings    # core dep
+uv add --group dev pytest   # dev/test dep
+```
+
+`uv add` updates `pyproject.toml` AND installs the package in one step. No `pip install` + `requirements.txt` editing — uv handles both.
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="`command not found: uv`">
+    Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh` (you may need to restart your shell or `source ~/.zshrc`).
+  </Accordion>
+  <Accordion title="`uv run uvicorn` says module not found">
+    Run `uv sync` first. uv won't auto-install missing deps when you `uv run`; the explicit sync step ensures the venv matches `pyproject.toml`.
+  </Accordion>
+  <Accordion title="Port 8000 already in use">
+    Another process is on 8000. Either kill it (`lsof -i :8000` then `kill <PID>`) or use a different port: `uv run uvicorn app.main:app --reload --port 8001`.
+  </Accordion>
+  <Accordion title="Mintlify shows blank or error">
+    Run `mintlify dev` from inside the `docs/` folder, not the project root. The CLI looks for `mint.json` in the current directory.
+  </Accordion>
+  <Accordion title="I prefer plain pip / venv — can I still use this?">
+    Yes. `uv pip install -e .` (with the project's `pyproject.toml`) installs everything into your active venv classically. But the docs assume `uv run` and `uv sync` going forward.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Problem statement" icon="book" href="/problem-statement">
+    Understand the domain first.
+  </Card>
+  <Card title="Module 01: Hello FastAPI" icon="rocket" href="/modules/01-hello-fastapi">
+    Write your first endpoint.
+  </Card>
+</CardGroup>

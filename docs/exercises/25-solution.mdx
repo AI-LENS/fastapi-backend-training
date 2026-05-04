@@ -1,0 +1,54 @@
+---
+title: "25 · Solution"
+description: "Dev compose override with pgadmin."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```yaml docker-compose.override.yml
+services:
+  api:
+    environment:
+      ENROLLMENT_LOG_LEVEL: DEBUG
+    volumes:
+      - ./tests:/app/tests   # mount tests for in-container test runs
+
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: dev@local
+      PGADMIN_DEFAULT_PASSWORD: dev
+      PGADMIN_CONFIG_SERVER_MODE: "False"   # skip first-login prompts in dev
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+```
+
+## Verify
+
+```bash
+docker compose up
+# pgadmin at http://localhost:5050
+# Connect to host=postgres, user=enrollment, password=<DB_PASSWORD>
+
+# Run tests in the container
+docker compose exec api pytest tests/integration -v
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why `docker-compose.override.yml` (specifically that name)?">
+    Compose auto-loads it on top of the main file. No `-f` flag needed. Production workflows use `docker compose -f docker-compose.yml up` (no override).
+  </Accordion>
+  <Accordion title="`PGADMIN_CONFIG_SERVER_MODE: 'False'`">
+    Skips the multi-user setup step that's annoying in dev. Don't set this in prod-deployed pgadmin.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 26: Deployment" icon="rocket" href="/modules/26-deployment" />

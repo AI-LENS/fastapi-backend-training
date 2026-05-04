@@ -1,0 +1,366 @@
+---
+title: "28 · Task queues at scale"
+description: "Celery, Arq, RQ, RabbitMQ, Kafka — what each is for. Outbox pattern. Retries and DLQ."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** Understand the full task-queue spectrum. Outbox pattern wired into the screening flow. You're ready to graduate to Celery/Arq when needed.
+</Tip>
+
+## Concept
+
+The in-process `BackgroundTaskRunner` (Module 13) and policy wrapper (Module 13b) are great for medium scale. But:
+
+- API restarts kill in-flight work
+- Workers can't scale across machines
+- A burst of 10,000 jobs OOMs the API
+
+Time for **external task queues**. They live in a separate process (or many), backed by a broker (Redis, RabbitMQ, Kafka).
+
+## The landscape, correctly classified
+
+| Tool | Type | Right for |
+|---|---|---|
+| **Celery** | Task framework | Mature, big ecosystem; works with Redis or RabbitMQ broker |
+| **Arq** | Async task framework | Modern async-native Python; lightweight; Redis-only |
+| **Dramatiq** | Task framework | Simpler than Celery; Redis or RabbitMQ |
+| **RQ** | Task framework | Simplest; Redis-only |
+| **Redis** | Broker / cache / queue store | Default broker for low-medium scale |
+| **RabbitMQ** | Production message broker | Advanced routing, large queues, high reliability |
+| **Kafka** | **Event streaming** | Multi-consumer fan-out, replay, log-style — **not** simple task execution |
+
+<Warning>
+  **Kafka is not a task queue.** It's an event log/streaming platform. Different problem. Don't reach for Kafka because "we need scale"; reach for it because you have multi-consumer event-streaming needs.
+</Warning>
+
+## Outbox pattern (the production-critical piece)
+
+We sketched this in Module 10b. Here's the full version:
+
+The problem:
+
+```python
+async with uow:
+    screening = await repo.create(...)
+    # SYSTEM CRASHES HERE — DB committed, queue not notified
+    await queue.publish("eligibility-pipeline", screening.id)
+```
+
+The fix: write the **publish intent** to an outbox table *in the same transaction* as the business write. A separate poller process drains the outbox and actually publishes to the queue.
+
+```
+   Transaction T:
+     ├── INSERT screenings (...)
+     └── INSERT outbox (event="eligibility-pipeline", payload={...})
+   COMMIT  ← both succeed atomically
+
+   Outbox Poller (separate process):
+     ├── SELECT * FROM outbox WHERE published_at IS NULL
+     ├── For each: queue.publish(...)
+     └── UPDATE outbox SET published_at=now() WHERE id=...
+```
+
+Now: if the API crashes between commit and publish, the outbox row stays. Poller picks it up on the next iteration. **Exactly-once publish semantics.**
+
+## Walkthrough
+
+### Part 1 — Outbox table
+
+```python app/models/outbox.py
+"""Outbox table for reliable event publishing."""
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from sqlalchemy import DateTime, JSON, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base
+
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+        index=True,
+    )
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+```
+
+(Don't forget the `from datetime import datetime, timezone` import.) Generate and apply the migration before continuing — the drainer in Part 4 needs the table to exist:
+
+```bash
+uv run alembic revision --autogenerate -m "add outbox table"
+uv run alembic upgrade head
+```
+
+### Part 2 — Outbox repo + service
+
+```python app/repositories/outbox_repository.py
+from datetime import datetime, timezone
+
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.outbox import OutboxEvent
+
+
+async def append(db, *, event_type: str, payload: dict) -> OutboxEvent:
+    event = OutboxEvent(event_type=event_type, payload=payload)
+    db.add(event)
+    await db.flush()
+    return event
+
+
+async def fetch_unpublished(db, *, limit: int = 100) -> list[OutboxEvent]:
+    result = await db.execute(
+        select(OutboxEvent)
+        .where(OutboxEvent.published_at.is_(None))
+        .order_by(OutboxEvent.created_at)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+async def mark_published(db, event_id):
+    await db.execute(
+        update(OutboxEvent)
+        .where(OutboxEvent.id == event_id)
+        .values(published_at=datetime.now(timezone.utc))
+    )
+```
+
+### Part 3 — Use the outbox in submit_screening
+
+The signature change is intentional: dispatch now happens from the drainer (Part 4), so `submit_screening` no longer needs `runner` or `progress`. **Update every caller** (your `screenings.py` route from Module 17b) to drop those arguments.
+
+```python app/services/screening_service.py
+from app.repositories import outbox_repository as outbox
+
+
+async def submit_screening(uow, *, user, payload):    # `runner` and `progress` removed
+    async with uow:
+        await permission_service.ensure_can_submit_for_site(uow.session, user, payload.site_id)
+        site = await site_cache.get_site_cached(uow.session, payload.site_id)
+        if site is None or not site.active:
+            raise InvalidSite(...)
+
+        screening = await repo.create(uow.session, **payload.model_dump())
+
+        await audit.append(uow.session, ...)
+
+        # Atomic with the screening insert
+        await outbox.append(
+            uow.session,
+            event_type="eligibility.requested",
+            payload={"screening_id": str(screening.id)},
+        )
+
+        return screening
+```
+
+The worker / `runner.submit` is now decoupled from the API request. The outbox poller (separate process, possibly even separate service) drains the queue.
+
+### Part 4 — A simple outbox drainer
+
+```python app/workers/outbox_drainer.py
+"""Periodically drains the outbox into the in-process worker (or external queue)."""
+import asyncio
+import logging
+from uuid import UUID
+
+from app.database import async_session   # the session factory you exposed in Module 05
+from app.repositories import outbox_repository as outbox
+# `run_eligibility_pipeline` is the public entry-point for the pipeline. If you
+# never extracted it as a module-level function in Module 13/13b, pull the
+# `_job` body out into a top-level coroutine in `screening_service.py` now and
+# import it here.
+from app.services.screening_service import run_eligibility_pipeline
+
+logger = logging.getLogger(__name__)
+
+
+async def drain_loop(runner, progress, *, interval_s: float = 1.0):
+    """Run forever (or until cancelled). Picks up unpublished events and dispatches."""
+    while True:
+        try:
+            async with async_session() as db:
+                events = await outbox.fetch_unpublished(db, limit=100)
+                for event in events:
+                    if event.event_type == "eligibility.requested":
+                        screening_id = UUID(event.payload["screening_id"])
+                        # Dispatch via your worker layer (in-process or external)
+                        await run_eligibility_pipeline(
+                            runner, async_session, progress, screening_id
+                        )
+                    # Mark published
+                    await outbox.mark_published(db, event.id)
+                if events:
+                    await db.commit()
+                    logger.info("Drained %d outbox events", len(events))
+        except Exception:
+            logger.exception("Outbox drainer error")
+        await asyncio.sleep(interval_s)
+```
+
+Start it from `lifespan`:
+
+```python app/main.py
+from app.workers.outbox_drainer import drain_loop
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... existing setup ...
+    drainer_task = asyncio.create_task(
+        drain_loop(app.state.task_runner, app.state.progress)
+    )
+    yield
+    drainer_task.cancel()
+    # ...
+```
+
+### Part 5 — Graduating to Arq (sketch)
+
+When in-process workers no longer cut it, swap to Arq:
+
+```bash
+uv add arq
+```
+
+```python app/workers/arq_worker.py
+"""Arq-based worker. Run as: `arq app.workers.arq_worker.WorkerSettings`"""
+from arq import create_pool
+from arq.connections import RedisSettings
+
+
+async def eligibility_pipeline(ctx, screening_id: str):
+    """Same logic that lived in `run_eligibility_pipeline`."""
+    # ... copy the body from screening_service ...
+
+
+class WorkerSettings:
+    redis_settings = RedisSettings(host="redis", port=6379)
+    functions = [eligibility_pipeline]
+    max_jobs = 10
+    max_tries = 3   # arq handles retries natively
+```
+
+The outbox drainer changes one line:
+
+```python
+# Instead of: await run_eligibility_pipeline(...)
+await arq_pool.enqueue_job("eligibility_pipeline", str(screening_id))
+```
+
+Everything else stays. **The architecture survived the upgrade.** That's the point.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why does the outbox poller need its own polling loop and not 'instant' triggers?">
+    Simplest reliable design. Postgres has `LISTEN/NOTIFY` for instant triggers but adds complexity. A 1-second poll is plenty for most workloads.
+  </Accordion>
+  <Accordion title="What if two pollers compete?">
+    `SELECT ... FOR UPDATE SKIP LOCKED` (Postgres feature) — each poller grabs different rows. SQLite doesn't support this; for production, use Postgres.
+  </Accordion>
+  <Accordion title="What's the difference between outbox and a regular task queue?">
+    Outbox is *durable* via DB transactions. A task queue is *fast* but loses messages on crash. The outbox + queue combo is the gold standard: outbox guarantees the intent is recorded, the queue executes fast.
+  </Accordion>
+  <Accordion title="When do I really need Kafka vs a queue?">
+    When you have multiple independent consumers of the same events ("audit service AND analytics service AND notification service all want every screening event"). Queues are point-to-point. Kafka is fan-out with replay.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit a screening">
+    Watch logs for:
+    ```
+    Drained 1 outbox events
+    Worker started: <id>
+    Pipeline completed
+    ```
+    The `Drained` line shows the outbox at work.
+  </Step>
+  <Step title="Crash test (manual)">
+    Submit, immediately kill the API (`kill -9 $UVICORN_PID`). Restart. The outbox row is still there; the drainer finds it; the pipeline runs.
+  </Step>
+  <Step title="Inspect the outbox">
+    ```bash
+    sqlite3 enrollment.db "SELECT id, event_type, published_at FROM outbox ORDER BY created_at DESC LIMIT 5"
+    ```
+    Most are published; one or two might be in-flight.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="When should I switch from in-process to external queue?">
+    When any of these are true: (1) jobs need to survive API restarts, (2) you need >1 worker process (e.g., for CPU isolation), (3) workers should scale across machines. Until then, in-process + outbox is fine.
+  </Accordion>
+  <Accordion title="Is the outbox a 'transactional outbox'?">
+    Yes — that's the formal name. There are also non-transactional outbox variants (e.g., write-ahead-log scraping with Debezium) but transactional is the simplest and most common.
+  </Accordion>
+  <Accordion title="What about exactly-once delivery?">
+    True exactly-once is impossible across systems. Outbox gives you "at-least-once with idempotent consumers" — equivalent in practice. Make the consumer idempotent (Module 13b's idempotency_key + JobRecord) and you're set.
+  </Accordion>
+  <Accordion title="What about Celery's `apply_async` after commit hook?">
+    Celery has `transaction-aware` patterns (e.g., django-celery's `on_commit` hook). They're a lighter form of the same idea — defer the publish until the transaction commits. Outbox is more durable (survives process death between commit and publish).
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Replace the in-process worker dispatch in the outbox drainer with **a real Arq enqueue**.
+
+    1. Run Arq's worker locally (or in compose).
+    2. Update the drainer to enqueue rather than call directly.
+    3. Confirm: drainer finishes fast (just enqueues), separate Arq worker logs show the actual pipeline running.
+
+    Bonus: configure Arq's retry semantics to match the production worker policy from Module 13b.
+  </Tab>
+  <Tab title="Hint">
+    `await arq_pool.enqueue_job("eligibility_pipeline", str(screening_id), _job_id=str(uuid4()), _defer_until=...)`. Set `max_tries`, `retry_delay` for backoff.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/28-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The outbox pattern is the bridge between "your DB is the source of truth" and "external systems will eventually know about it".** It accepts the messy reality (networks fail, processes die) and turns it into a property: the DB commit *is* the contract; the rest is bookkeeping. This is one of the few patterns that genuinely earns the label "production-grade".
+</Tip>
+
+## Real-world reference
+
+AnnotateHub uses `ThreadPoolExecutor` for in-process workers — no outbox, no external queue. Adding both would be the natural production-readiness upgrade.
+
+## You finished the curriculum
+
+🎉 Congrats. You now know the full production-grade pattern set. From here it's specialization (your domain) and operations (running it well).
+
+<CardGroup cols={3}>
+  <Card title="Reference" icon="book" href="/reference/architecture">
+    Bookmark the architecture summary.
+  </Card>
+  <Card title="Cheatsheet" icon="terminal" href="/reference/cheatsheet">
+    Daily commands reference.
+  </Card>
+  <Card title="Real codebase" icon="code">
+    Read AnnotateHub now — you'll recognize every pattern.
+  </Card>
+</CardGroup>

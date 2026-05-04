@@ -1,0 +1,70 @@
+---
+title: "13 · Solution"
+description: "Cancel a running pipeline."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/exceptions.py
+class NoPipelineRunning(ConflictError):
+    code = "no_pipeline_running"
+```
+
+```python app/services/screening_service.py
+from app.exceptions import NoPipelineRunning
+
+
+async def cancel_pipeline(
+    db: AsyncSession,
+    runner: BackgroundTaskRunner,
+    screening_id: UUID,
+) -> Screening:
+    screening = await get_screening(db, screening_id)
+
+    cancelled = runner.cancel(screening_id)
+    if not cancelled:
+        raise NoPipelineRunning(
+            f"No pipeline running for screening {screening_id}",
+            details={"screening_id": str(screening_id)},
+        )
+
+    return await repo.update_status(
+        db,
+        screening,
+        status="submitted",
+        eligibility_result=None,
+        failed_criteria=None,
+    )
+```
+
+```python app/routers/screenings.py
+@router.post("/{screening_id}/cancel-pipeline", response_model=ScreeningResponse)
+async def cancel_pipeline_route(
+    screening_id: UUID,
+    db: AsyncSession = Depends(get_db_session),
+    runner = Depends(get_task_runner),
+):
+    return await service.cancel_pipeline(db, runner, screening_id)
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why reset `eligibility_result` and `failed_criteria`?">
+    The pipeline was interrupted; partial results are misleading. Clear them so a re-run starts clean.
+  </Accordion>
+  <Accordion title="Could there be a race? Pipeline finishes between cancel attempt and status update?">
+    Yes. In production you'd:
+    1. Use a more atomic state machine (e.g., `running → cancelling → cancelled`)
+    2. Have the pipeline check a "should I stop?" flag periodically (cooperative cancellation — Module 14 preview)
+    3. Use a single `UPDATE ... WHERE status='reviewing'` to avoid overwriting a completed status
+
+    For training, "best effort cancel" is fine.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 14: Pipelines" icon="gear" href="/modules/14-pipelines" />

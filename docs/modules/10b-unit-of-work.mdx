@@ -1,0 +1,364 @@
+---
+title: "10b · Unit of Work & transactions"
+description: "Explicit transaction boundaries owned by services. The pattern that keeps multi-step writes consistent."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~25 lines · **Outcome:** Multi-step service operations commit atomically. Worker dispatch happens after commit, not before.
+</Tip>
+
+## Concept
+
+Right now your repos look like this:
+
+```python
+async def create(db, ...):
+    db.add(screening)
+    await db.commit()       # ← repo commits
+    await db.refresh(screening)
+    return screening
+```
+
+Convenient. But it has a critical flaw the moment you have **two writes** that must succeed or fail together.
+
+### The danger: two writes, one transaction (or not)
+
+Imagine you want to enroll a screening AND log an audit row in the same operation:
+
+```python
+# DANGEROUS — repo-level commits
+await screening_repo.mark_enrolled(db, screening, subject_id=sid)  # commits
+await audit_repo.log(db, action="enrolled", screening_id=...)       # commits separately
+```
+
+If the audit log call fails (DB blip, validation error), you have a screening marked enrolled with **no audit trail**. The two writes are *not atomic*. Your DB is now in an inconsistent state.
+
+### The fix: Unit of Work
+
+The Unit of Work (UoW) pattern says: **services own transaction boundaries**. Repos *don't commit*. The service decides when the unit is done.
+
+```python
+async with uow:                                  # ← starts transaction
+    await screening_repo.mark_enrolled(...)      # no commit
+    await audit_repo.log(...)                    # no commit
+# ↑ exits the `async with` → commit if no exception, rollback if there was one
+```
+
+Both writes succeed together, or neither does. **Atomic.**
+
+### Why this matters more than it seems
+
+<CardGroup cols={3}>
+  <Card title="Multi-step workflows" icon="link">
+    "Enroll subject AND notify the system" needs both to succeed or roll back.
+  </Card>
+  <Card title="Reliability" icon="shield">
+    Half-completed operations are the most painful production bug to debug. UoW removes the entire class.
+  </Card>
+  <Card title="Outbox pattern" icon="rocket">
+    The foundation for "publish a message only if the DB write commits". Module 28 builds on this.
+  </Card>
+</CardGroup>
+
+### The publish-after-commit problem (preview)
+
+Right now in Module 13 you do this:
+
+```python
+screening = await service.submit_screening(db, payload)
+await run_eligibility_pipeline(runner, async_session, screening.id)  # ← schedules worker
+return screening
+```
+
+What if `submit_screening` succeeded but the response is never sent (network drop)? Or what if you scheduled the worker, then something blew up, leaving an orphaned background job for a non-existent screening?
+
+The UoW gives us **`publish_after_commit`** — register intent to schedule the worker, but only fire it once the DB transaction commits. Module 28 expands this into the full outbox pattern.
+
+## Walkthrough
+
+### Step 1 — Create the Unit of Work
+
+```python app/db/__init__.py
+# empty
+```
+
+```python app/db/unit_of_work.py
+"""Unit of Work — transaction boundary owned by services."""
+from __future__ import annotations
+
+import logging
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+logger = logging.getLogger(__name__)
+
+
+class UnitOfWork:
+    """Wrap a session in an explicit transaction boundary.
+
+    Usage:
+        async with uow:
+            await repo.do_thing(uow.session, ...)
+            await repo.do_other(uow.session, ...)
+            uow.publish_after_commit(send_notification, args=(...))
+        # commits here on clean exit, rolls back on exception
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
+        self._session_factory = session_factory
+        self.session: AsyncSession | None = None
+        self._after_commit: list[tuple[Callable[..., Awaitable], tuple, dict]] = []
+
+    async def __aenter__(self) -> "UnitOfWork":
+        self.session = self._session_factory()
+        await self.session.begin()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        try:
+            if exc is None:
+                await self.session.commit()
+                await self._run_after_commit_hooks()
+            else:
+                await self.session.rollback()
+                logger.warning("UoW rolled back: %s", exc)
+        finally:
+            await self.session.close()
+            self.session = None
+            self._after_commit.clear()
+
+    def publish_after_commit(
+        self,
+        coro_factory: Callable[..., Awaitable],
+        args: tuple = (),
+        kwargs: dict | None = None,
+    ) -> None:
+        """Register a coroutine to run after a successful commit.
+
+        Used for: scheduling workers, sending notifications, calling external APIs —
+        anything that should happen IFF the DB transaction succeeded.
+        """
+        self._after_commit.append((coro_factory, args, kwargs or {}))
+
+    async def _run_after_commit_hooks(self) -> None:
+        for fn, args, kwargs in self._after_commit:
+            try:
+                await fn(*args, **kwargs)
+            except Exception:
+                # Hook failures don't roll back — DB is already committed.
+                # In production you'd write to an outbox table for retry (Module 28).
+                logger.exception("after_commit hook failed: %s", fn.__name__)
+```
+
+### Step 2 — Stop committing in repos
+
+Repos should **add to the session and refresh after commit**, but never commit themselves.
+
+```python app/repositories/screening_repository.py
+async def create(db: AsyncSession, **fields) -> Screening:
+    screening = Screening(**fields)
+    db.add(screening)
+    await db.flush()           # writes to DB but doesn't commit yet
+    await db.refresh(screening)
+    return screening
+
+
+async def update_status(db, screening, *, status, eligibility_result=None, failed_criteria=None):
+    screening.status = status
+    if eligibility_result is not None:
+        screening.eligibility_result = eligibility_result
+    if failed_criteria is not None:
+        screening.failed_criteria = failed_criteria
+    await db.flush()
+    return screening
+
+
+# Same change for `mark_enrolled` and `delete`.
+```
+
+`flush()` writes pending changes to the DB without committing the transaction. This lets the service compose multiple operations in one transaction.
+
+### Step 3 — Add a UoW dependency
+
+```python app/dependencies.py
+from app.database import async_session
+from app.db.unit_of_work import UnitOfWork
+
+
+def get_uow() -> UnitOfWork:
+    return UnitOfWork(async_session)
+```
+
+### Step 4 — Refactor a service to use UoW
+
+```python app/services/screening_service.py
+async def enroll_screening(uow: UnitOfWork, screening_id: UUID) -> Screening:
+    """Atomic: validate → mark enrolled → audit. All-or-nothing."""
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        if screening.status == "enrolled":
+            raise AlreadyEnrolled(f"Screening {screening_id} is already enrolled")
+        if screening.eligibility_result != "eligible":
+            raise IneligibleScreening(f"Screening {screening_id} not eligible")
+
+        subject_id = _generate_subject_id()
+        await repo.mark_enrolled(uow.session, screening, subject_id=subject_id)
+        # Module 17c will add: await audit_repo.log(uow.session, action="enrolled", ...)
+
+        return screening
+```
+
+### Step 5 — Update the route
+
+```python app/routers/screenings.py
+from app.dependencies import get_uow
+
+
+@router.post("/{screening_id}/enroll", response_model=ScreeningResponse)
+async def enroll(
+    screening_id: UUID,
+    uow: UnitOfWork = Depends(get_uow),
+):
+    return await service.enroll_screening(uow, screening_id)
+```
+
+### Step 6 — Use `publish_after_commit` for the pipeline trigger
+
+<Note>
+  **Forward reference.** The snippet below previews how UoW will compose with the worker (`BackgroundTaskRunner`, Module 13) and progress manager (`ProgressManager`, Module 15). Don't try to run it yet — `BackgroundTaskRunner`, `ProgressManager`, and `run_eligibility_pipeline` don't exist in your codebase until those later modules. For Module 10b, stop after Step 4's `enroll_screening` UoW shape; revisit this snippet after Module 15.
+
+  When you do wire it up, you'll also need `from app.database import async_session` at the top of `screening_service.py`.
+</Note>
+
+```python app/services/screening_service.py
+# Preview only — wires up properly in Modules 13 & 15.
+async def submit_screening(
+    uow: UnitOfWork,
+    runner: "BackgroundTaskRunner",       # introduced in Module 13
+    progress: "ProgressManager",          # introduced in Module 15
+    payload: ScreeningCreate,
+) -> Screening:
+    async with uow:
+        # Validate site
+        site = await site_repository.get_by_id(uow.session, payload.site_id)
+        if site is None or not site.active:
+            raise InvalidSite(f"Site {payload.site_id} unknown or inactive")
+
+        screening = await repo.create(uow.session, **payload.model_dump())
+
+        # Will only fire if commit succeeds
+        uow.publish_after_commit(
+            run_eligibility_pipeline,         # added in Module 13
+            args=(runner, async_session, progress, screening.id),
+        )
+
+        return screening
+```
+
+If `repo.create` raises, the `publish_after_commit` registration is discarded along with the rollback — no orphaned worker.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why use `await session.begin()` explicitly?">
+    SQLAlchemy 2.0 supports two transaction styles: implicit (auto-begin on first query) and explicit (`begin()` opens a transaction we control). UoW uses explicit so the boundary is unambiguous.
+  </Accordion>
+  <Accordion title="`flush()` vs `commit()`">
+    `flush()` sends pending SQL to the DB but keeps the transaction open. `commit()` makes everything permanent and ends the transaction. Repos flush so refreshes work; services commit (via UoW exit) so the unit is atomic.
+  </Accordion>
+  <Accordion title="What if a hook in `_run_after_commit_hooks` fails?">
+    The DB is already committed — we can't roll back. We log and move on. To make hooks reliable, you'd write them to an **outbox table** (Module 28) and retry from there. That's the production-grade fix.
+  </Accordion>
+  <Accordion title="Could I use `async with session.begin():` instead of UoW?">
+    Yes — for trivial single-step writes. UoW adds value when you need: (1) `publish_after_commit`, (2) explicit session injection across repo calls, (3) testability (override the UoW dep).
+  </Accordion>
+  <Accordion title="What about read-only operations — do they need UoW?">
+    Not really. A bare `Depends(get_db_session)` is fine for reads. UoW is for **writes that must be atomic**.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit a screening with a bad site_id">
+    ```bash
+    curl -i -X POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"BOGUS","candidate_initials":"AB","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["x"]}'
+    ```
+    400 with `invalid_site`. Crucially: **no orphaned worker job** for a screening that was never created.
+  </Step>
+  <Step title="Force a deliberate rollback for testing">
+    Add this temporary line in `submit_screening`, after `repo.create`, before `publish_after_commit`:
+    ```python
+    raise RuntimeError("Boom")  # remove after testing
+    ```
+    Submit a screening. Server returns 500. Check the DB:
+    ```bash
+    sqlite3 enrollment.db "SELECT COUNT(*) FROM screenings WHERE candidate_initials = 'XY'"
+    # Expect 0 — the row was rolled back
+    ```
+    Remove the `raise` after testing.
+  </Step>
+  <Step title="Verify normal path still works">
+    Submit a valid screening. The worker fires, status transitions, screening enrolls.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Is UoW the same as a database transaction?">
+    Closely related. The UoW *manages* a transaction (begin/commit/rollback) and adds Python-level capabilities (`publish_after_commit`, hooks). Without UoW, transactions still exist — they're just managed implicitly per-statement.
+  </Accordion>
+  <Accordion title="Should every service operation use UoW?">
+    Every operation that **writes**. Reads can use a bare session.
+  </Accordion>
+  <Accordion title="What if my service needs to call another service (composition)?">
+    Pass the UoW down. Both services share `uow.session`, so all writes commit together. Don't open a new UoW from within a service — that creates nested transactions, which SQLAlchemy will rebel against.
+  </Accordion>
+  <Accordion title="What's an 'outbox table' and why do I keep mentioning it?">
+    A table in the same DB used to record "intents to publish" — e.g., "send email about screening X". A separate process polls this table and actually performs the publish. Because the row is written in the same transaction as the business write, you get exactly-once semantics. Module 28 builds the full pattern.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Refactor `cancel_screening` (delete) and `update_eligibility` to use `UnitOfWork`.
+
+    1. Both service operations now take `uow: UnitOfWork` instead of `db: AsyncSession`.
+    2. Repos no longer commit (already done in Step 2).
+    3. Wrap the service body in `async with uow:`.
+    4. Update the corresponding routes to inject `uow = Depends(get_uow)`.
+
+    Verify everything still works end-to-end.
+  </Tab>
+  <Tab title="Hint">
+    Same pattern as `enroll_screening`. Read with `repo.get_by_id(uow.session, ...)`. Write with `repo.delete(uow.session, ...)`. Let `__aexit__` commit.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/10b-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Implicit transactions are fine for prototypes; explicit transactions are mandatory for production.** When you can read a service function and immediately know "this commits at the end", you have a transaction boundary you can reason about. When commits are scattered through repo calls, you can't — and that's exactly when "half-completed states" creep in.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub commits inside repositories (the simpler pattern). Switching to UoW is a senior-engineer-level refactor often done when the codebase grows complex enough that multi-step writes become common.
+
+## Next module
+
+<Card title="Module 11: Custom exceptions" icon="shield" href="/modules/11-exceptions">
+  Now that transactions are clean, formalize the exception layer.
+</Card>

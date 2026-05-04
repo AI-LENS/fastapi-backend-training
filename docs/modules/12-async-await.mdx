@@ -1,0 +1,226 @@
+---
+title: "12 · Async/await"
+description: "When to use async def vs def, blocking calls, the event loop, common pitfalls."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~5 lines · **Outcome:** Solid mental model for async — and you'll know how to handle blocking libraries without freezing your server.
+</Tip>
+
+## Concept
+
+You've been using `async def` and `await` since Module 05. Time to make sure you understand why.
+
+### The event loop, in plain English
+
+A FastAPI app runs **one thread** with **one event loop**. That loop juggles many concurrent requests by yielding to other work whenever a request `await`s something I/O-bound.
+
+```
+Time →
+Loop: req1.start  req1.await(db)  req2.start  req2.await(db)  req1.resume  req1.send_response  req2.resume  ...
+            ↑              ↑                                          ↑
+         starts         pauses for DB                            DB came back
+```
+
+While `req1` waits for the DB, `req2` runs. **The single thread does both** — that's concurrency without threads.
+
+### The cardinal sin
+
+If you call something **blocking** (i.e., not awaitable) inside an `async def`, the loop has nothing else to do. **All other requests freeze** until your blocking call returns.
+
+```python
+@app.get("/bad")
+async def bad():
+    time.sleep(5)  # ← BLOCKING. Server is dead for 5 seconds for everyone.
+    return {"ok": True}
+```
+
+```python
+@app.get("/good")
+async def good():
+    await asyncio.sleep(5)  # ← yields to the loop. Server stays responsive.
+    return {"ok": True}
+```
+
+### `def` vs `async def` route handlers
+
+| Choice | What FastAPI does |
+|---|---|
+| `def handler():` | Runs it in a thread pool. Safe for sync libraries (PIL, pandas). Slower per call. |
+| `async def handler():` | Runs it on the event loop. Fast. **Must NOT call blocking code.** |
+
+Default to `async def`. Switch to `def` only when an entire handler is sync-bound.
+
+## Walkthrough
+
+### Step 1 — Identify async vs sync calls in our app
+
+Run `grep -n "def " app/routers/screenings.py app/services/*.py app/repositories/*.py`. Every function we wrote is `async`. Every database call uses `await`. The **chain is unbroken** — no sync DB call masquerading inside an async wrapper.
+
+### Step 2 — A demonstration of the bad path
+
+Add this to `main.py` *temporarily* to see what blocking looks like:
+
+```python
+import time
+
+@app.get("/demo/blocking")
+async def demo_blocking():
+    """DON'T DO THIS. Demonstrates blocking the event loop."""
+    time.sleep(3)
+    return {"slept": "3s, blocking"}
+
+
+@app.get("/demo/non-blocking")
+async def demo_non_blocking():
+    """DO THIS. Yields to the loop while sleeping."""
+    import asyncio
+    await asyncio.sleep(3)
+    return {"slept": "3s, non-blocking"}
+```
+
+Try this in two terminals at once:
+
+```bash
+# Terminal A
+curl http://localhost:8000/demo/blocking &
+# Terminal B (immediately)
+curl http://localhost:8000/api/v1/sites
+```
+
+The `/sites` request **waits 3 seconds** because `/demo/blocking` froze the loop. Now repeat with `/demo/non-blocking` — `/sites` returns immediately.
+
+**Delete those two routes after you've seen the difference.** Don't ship demo code.
+
+### Step 3 — When you must use a blocking library
+
+Suppose Module 25 brings in a blocking library (e.g., `Pillow` for image processing, or `pandas` for CSV crunching). Two escape hatches:
+
+```python
+import asyncio
+
+# Option 1: asyncio.to_thread (Python 3.9+) — simplest
+result = await asyncio.to_thread(some_blocking_function, arg1, arg2)
+
+# Option 2: explicit ThreadPoolExecutor (more control)
+loop = asyncio.get_running_loop()
+result = await loop.run_in_executor(executor, some_blocking_function, arg1, arg2)
+```
+
+Both schedule the function on a thread pool, freeing the event loop. Module 13 uses Option 2 for the worker.
+
+### Common pitfalls
+
+<AccordionGroup>
+  <Accordion title="Forgetting `await`">
+    ```python
+    result = repo.get_by_id(db, id)  # returns a coroutine object, not the screening!
+    ```
+    `result` is now a coroutine you never awaited. The DB call never ran. Symptoms: weird responses, "coroutine was never awaited" warnings in logs. **Always await async function calls.**
+  </Accordion>
+  <Accordion title="Calling sync DB drivers in async routes">
+    `psycopg2.connect(...)` is sync. Calling it inside an `async def` blocks the loop. Use `asyncpg` (or sync drivers wrapped in `to_thread`).
+  </Accordion>
+  <Accordion title="Making HTTP calls with `requests`">
+    `requests.get(...)` is sync. Use `httpx.AsyncClient` for async HTTP. `requests` works in `def` handlers but not `async def`.
+  </Accordion>
+  <Accordion title="`asyncio.create_task(...)` and forgetting to keep a reference">
+    ```python
+    asyncio.create_task(do_something())   # Task may be garbage-collected mid-run!
+    ```
+    Always store the reference: `task = asyncio.create_task(...)` and decide when (or whether) to await it. Module 13 covers this.
+  </Accordion>
+  <Accordion title="`time.sleep` instead of `asyncio.sleep`">
+    Already covered. The single most common async bug. Worth grepping your codebase for `time.sleep` regularly.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Two-terminal demo (above)">
+    Confirm with your own eyes: blocking sleeps freeze unrelated requests; async sleeps don't.
+  </Step>
+  <Step title="Find any `time.sleep` in your codebase">
+    ```bash
+    grep -rn "time.sleep" app/
+    ```
+    Should be empty. (If it isn't, fix it now.)
+  </Step>
+  <Step title="Look at `asyncio.to_thread` semantics">
+    ```python
+    import asyncio, time
+
+    async def demo():
+        # This blocks the loop:
+        # time.sleep(2)
+        # This doesn't:
+        await asyncio.to_thread(time.sleep, 2)
+    ```
+    Try wiring this into a temporary route to feel the difference.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="If async is so much better, why does FastAPI support `def` at all?">
+    Two reasons: (1) sync libraries dominate Python — pandas, scikit-learn, Pillow, numpy. (2) Some teams transition gradually. FastAPI's automatic threading for `def` handlers is the bridge. Cost: each `def` handler ties up a thread; you can't scale as high as pure async.
+  </Accordion>
+  <Accordion title="Is `async def` always faster?">
+    For I/O-bound work, yes — by orders of magnitude under load. For CPU-bound work, no — the GIL is still there. CPU-bound work belongs in a thread or process pool (Module 13).
+  </Accordion>
+  <Accordion title="What's `await` actually doing?">
+    Yielding control to the event loop until the awaited coroutine completes. The loop runs other ready coroutines while waiting. Mechanically: it's a `yield from` over a generator-like protocol.
+  </Accordion>
+  <Accordion title="Can I `await` outside an async function?">
+    No. `await` only works inside `async def`. Top-level scripts use `asyncio.run(main())` to bridge.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Spot the bug.
+
+    Below is a fictional service function that's been the source of "weird intermittent slowness" in production. Identify what's wrong and fix it. Write your fixed version in a comment or scratch file.
+
+    ```python
+    import time
+    import requests
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from app.repositories import screening_repository as repo
+
+    async def fetch_external_then_save(db: AsyncSession, payload: dict) -> Screening:
+        time.sleep(0.5)  # rate-limit guard
+        response = requests.post("https://api.example.com/audit", json=payload)
+        response.raise_for_status()
+        return await repo.create(db, **payload)
+    ```
+
+    Find **at least two** problems and explain how to fix each.
+  </Tab>
+  <Tab title="Hint">
+    Two functions in there are blocking. Both will freeze the event loop under load.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/12-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **"Async first" is the only sane default for FastAPI in 2026.** Mixing sync calls into async handlers is the #1 cause of "we deployed and our latency tripled" production incidents. Build a habit: every time you `import` something, ask "does this library have an async equivalent?" Usually it does (`asyncpg`, `httpx`, `aiosqlite`, `aioredis`, `aiofiles`). Use it.
+</Tip>
+
+## Real-world reference
+
+The whole AnnotateHub codebase. Notice in `app/main.py:42` how it explicitly creates a `ThreadPoolExecutor` — that's the escape hatch for the unavoidably-blocking parts (PDF rendering, ML inference). The rest of the codebase stays pure async.
+
+## Next module
+
+<Card title="Module 13: Workers" icon="gear" href="/modules/13-workers">
+  Now that you understand async, build a real background worker.
+</Card>

@@ -1,0 +1,339 @@
+---
+title: "15 · Real-time updates (SSE)"
+description: "Stream pipeline progress via Server-Sent Events. WebSockets briefly."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~25 lines · **Outcome:** A `GET /screenings/{id}/progress` SSE stream that pushes stage updates live.
+</Tip>
+
+## Concept
+
+Polling is wasteful:
+
+```
+GET /screenings/abc → reviewing
+GET /screenings/abc → reviewing
+GET /screenings/abc → reviewing  (...100 polls...)
+GET /screenings/abc → eligible    ← finally
+```
+
+**Server-Sent Events (SSE)** invert it: the client opens **one** HTTP connection; the server pushes events whenever they happen.
+
+```
+Client: open SSE stream
+Server: stage check_age complete (passed)
+Server: stage check_diagnosis complete (passed)
+Server: ...
+Server: complete (eligible)
+[connection closes]
+```
+
+### SSE vs WebSockets vs polling
+
+| | Direction | Setup | Right for |
+|---|---|---|---|
+| Polling | C ↔ S | Trivial | Simple status; low traffic |
+| **SSE** | **S → C** | **Trivial** | **One-way streaming progress** |
+| WebSockets | C ↔ S | Heavier | Two-way (chat, collab editing) |
+
+**For pipeline progress, SSE is almost always the right choice.**
+
+## Walkthrough
+
+### Step 1 — Install `sse-starlette`
+
+```bash
+uv add sse-starlette
+```
+
+### Step 2 — A simple in-memory pub/sub
+
+```python app/services/progress_manager.py
+"""In-memory pub/sub for progress events.
+
+For multi-process deployment you'd use Redis pub/sub here. Single-process is enough
+for the training app and matches AnnotateHub's approach.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from typing import AsyncIterator
+from uuid import UUID
+
+
+@dataclass
+class ProgressEvent:
+    event_type: str           # "stage_complete" | "pipeline_complete"
+    screening_id: str
+    stage: str | None = None
+    passed: bool | None = None
+    reason: str | None = None
+    eligible: bool | None = None
+    failed_criteria: list[str] | None = None
+
+
+class ProgressManager:
+    """Subscriber model: one queue per active subscription."""
+
+    def __init__(self) -> None:
+        self._queues: dict[UUID, list[asyncio.Queue]] = defaultdict(list)
+
+    async def emit(self, screening_id: UUID, event: ProgressEvent) -> None:
+        for q in self._queues.get(screening_id, []):
+            await q.put(event)
+
+    async def subscribe(self, screening_id: UUID) -> AsyncIterator[ProgressEvent]:
+        q: asyncio.Queue = asyncio.Queue()
+        self._queues[screening_id].append(q)
+        try:
+            while True:
+                event = await q.get()
+                yield event
+                if event.event_type == "pipeline_complete":
+                    return
+        finally:
+            self._queues[screening_id].remove(q)
+            if not self._queues[screening_id]:
+                del self._queues[screening_id]
+```
+
+### Step 3 — Wire into lifespan + dep
+
+```python app/main.py
+from app.services.progress_manager import ProgressManager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ...
+    app.state.progress = ProgressManager()
+    # ...
+```
+
+```python app/dependencies.py
+from app.services.progress_manager import ProgressManager
+
+
+def get_progress_manager(request: Request) -> ProgressManager:
+    return request.app.state.progress
+```
+
+### Step 4 — Plug into the pipeline
+
+The orchestrator already accepts an `on_stage_complete` callback. Wire it up in the worker:
+
+```python app/services/screening_service.py
+from app.services.progress_manager import ProgressEvent, ProgressManager
+
+
+async def run_eligibility_pipeline(
+    runner: BackgroundTaskRunner,
+    db_factory,
+    progress: ProgressManager,
+    screening_id: UUID,
+) -> None:
+    async def _job():
+        async with db_factory() as db:
+            screening = await get_screening(db, screening_id)
+            if screening.status != "submitted":
+                return
+            await repo.update_status(db, screening, status="reviewing")
+
+            async def on_stage(result):
+                await progress.emit(
+                    screening_id,
+                    ProgressEvent(
+                        event_type="stage_complete",
+                        screening_id=str(screening_id),
+                        stage=result.name,
+                        passed=result.passed,
+                        reason=result.reason,
+                    ),
+                )
+
+            outcome = await run_pipeline(screening, on_stage_complete=on_stage)
+
+            await repo.update_status(
+                db, screening,
+                status="eligible" if outcome.eligible else "ineligible",
+                eligibility_result="eligible" if outcome.eligible else "ineligible",
+                failed_criteria=outcome.failed_criteria,
+            )
+
+            await progress.emit(
+                screening_id,
+                ProgressEvent(
+                    event_type="pipeline_complete",
+                    screening_id=str(screening_id),
+                    eligible=outcome.eligible,
+                    failed_criteria=outcome.failed_criteria,
+                ),
+            )
+
+    runner.submit(screening_id, _job)
+```
+
+Update `routers/screenings.py` to pass the progress manager:
+
+```python app/routers/screenings.py
+from app.dependencies import get_progress_manager
+
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+async def create_screening(
+    payload: ScreeningCreate,
+    db: AsyncSession = Depends(get_db_session),
+    runner = Depends(get_task_runner),
+    progress = Depends(get_progress_manager),
+):
+    screening = await service.submit_screening(db, payload)
+    await run_eligibility_pipeline(runner, async_session, progress, screening.id)
+    return screening
+```
+
+### Step 5 — The SSE endpoint
+
+```python app/routers/screenings.py
+from dataclasses import asdict
+from fastapi import Request
+from sse_starlette.sse import EventSourceResponse
+
+
+@router.get("/{screening_id}/progress")
+async def screening_progress(
+    screening_id: UUID,
+    request: Request,
+    progress = Depends(get_progress_manager),
+):
+    """Server-Sent Events stream of pipeline progress."""
+
+    async def event_generator():
+        async for event in progress.subscribe(screening_id):
+            if await request.is_disconnected():
+                break
+            yield {
+                "event": event.event_type,
+                "data": asdict(event),
+            }
+
+    return EventSourceResponse(event_generator())
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`asyncio.Queue` as a per-subscriber buffer">
+    Each subscribed client gets its own queue. The publisher fans out events into all queues. Clients that disconnect mid-stream don't break others.
+  </Accordion>
+  <Accordion title="Why check `await request.is_disconnected()`?">
+    SSE clients close connections silently — the server keeps writing forever otherwise. Checking each iteration lets us bail early. Critical for resource cleanup.
+  </Accordion>
+  <Accordion title="`yield {'event': ..., 'data': ...}`">
+    `sse-starlette`'s contract: yield dicts; it formats them as SSE wire protocol (`event: ...\ndata: ...\n\n`). The browser's `EventSource` API parses these into named events.
+  </Accordion>
+  <Accordion title="What about cross-process / multi-worker deployments?">
+    A single in-memory `ProgressManager` only works if the publisher and subscriber run in the same process. Multi-worker → use Redis pub/sub. Same pattern, different transport.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Open the SSE stream BEFORE submitting">
+    Terminal A:
+    ```bash
+    # Get a UUID we'll use
+    SID=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    # Open SSE stream (will hang waiting for events)
+    curl -N "http://localhost:8000/api/v1/screenings/$SID/progress"
+    ```
+    The `-N` keeps `curl` from buffering. The connection stays open.
+  </Step>
+  <Step title="Submit a screening that uses that SID">
+    For convenience, just submit any screening and watch its specific SSE:
+
+    Terminal B:
+    ```bash
+    SID=$(curl -sX POST http://localhost:8000/api/v1/screenings -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"SS","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["x"]}' | jq -r .id)
+    echo "Subscribe with: curl -N http://localhost:8000/api/v1/screenings/$SID/progress"
+    ```
+    Then in Terminal A run that curl. You'll see all stage events stream in real time.
+  </Step>
+  <Step title="Watch the events">
+    Output looks like:
+    ```
+    event: stage_complete
+    data: {"event_type": "stage_complete", "stage": "age", "passed": true, ...}
+
+    event: stage_complete
+    data: {"event_type": "stage_complete", "stage": "diagnosis", ...}
+
+    ...
+
+    event: pipeline_complete
+    data: {"event_type": "pipeline_complete", "eligible": true, ...}
+    ```
+    Connection closes after `pipeline_complete`.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What if I subscribe AFTER the pipeline finished?">
+    You miss the events. Module 27's idempotency-key pattern is the durable fix; for now, the client should subscribe *before* the long-running operation, or fall back to polling `GET /screenings/{id}` to read the final state.
+  </Accordion>
+  <Accordion title="How is SSE different from chunked HTTP?">
+    SSE is *built on* chunked HTTP, but adds: structured event names, automatic reconnection (in browsers' `EventSource`), text encoding, message IDs for replay. Browsers natively support it.
+  </Accordion>
+  <Accordion title="When would I prefer WebSockets?">
+    Two-way communication (chat, collab editing, live cursor positions). For one-way "server pushes me updates" — SSE is simpler and more cache-friendly.
+  </Accordion>
+  <Accordion title="My pipeline is fast — does SSE add overhead?">
+    Negligible. The connection is HTTP/1.1; the marginal cost per event is small. If your pipeline finishes in under 100 ms, polling is also fine.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a `started` event emitted at the very start of the pipeline (before stage 1).
+
+    1. Define a new event type. Update `ProgressEvent` if needed.
+    2. Emit it from the worker right after `status=reviewing`.
+    3. Confirm the SSE stream now starts with a `started` event.
+  </Tab>
+  <Tab title="Hint">
+    ```python
+    await progress.emit(
+        screening_id,
+        ProgressEvent(event_type="started", screening_id=str(screening_id)),
+    )
+    ```
+    No code changes to `ProgressEvent` needed — `event_type` is already a free-form string.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/15-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The orchestrator's callback hook (`on_stage_complete`) is invisible until you need it.** This is the value of pure stages + orchestrator: when SSE became a requirement, you didn't change a stage. You added a hook in the orchestrator and a publisher in the worker — and the rest of the system stayed identical. That's the architectural payoff.
+</Tip>
+
+## Real-world reference
+
+- `Final CRF Annotation/annotate-hub-api/app/services/progress_manager.py` — production version
+- `Final CRF Annotation/annotate-hub-api/app/routers/jobs.py:74-89` — the SSE endpoint
+
+## Next module
+
+<Card title="Module 16: JWT auth" icon="shield" href="/modules/16-jwt-auth">
+  Time to make `coordinator` and `sponsor` real. Login, password hashing, and JWT tokens.
+</Card>

@@ -1,0 +1,260 @@
+---
+title: "19 · Rate limiting & caching"
+description: "In-memory rate limit, Redis cache intro, when each is appropriate."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~25 lines · **Outcome:** Login endpoint protected from brute force. Hot reads served from cache instead of DB.
+</Tip>
+
+## Concept
+
+Two unrelated patterns, both load-bearing in production:
+
+<CardGroup cols={2}>
+  <Card title="Rate limiting" icon="shield">
+    Cap how often a client can hit endpoints. Stops brute-force, scraping, accidental DoS.
+  </Card>
+  <Card title="Caching" icon="rocket">
+    Skip the DB for repeated reads. Lower latency, lower DB load.
+  </Card>
+</CardGroup>
+
+### Rate limiting picks
+
+| Approach | Where state lives | Right for |
+|---|---|---|
+| **In-memory** (`slowapi`) | The Python process | Single-server apps |
+| **Redis-backed** (`slowapi` w/ Redis) | Shared Redis | Multi-worker, multi-server |
+| **At the load balancer** (NGINX, Cloudflare, AWS WAF) | Edge | Coarse-grained protection at scale |
+
+Default to in-memory for the training app. Mention the Redis upgrade path explicitly — that's the production graduation.
+
+### Cache patterns
+
+| Pattern | Behavior |
+|---|---|
+| **Cache-aside** (lazy) | Read cache; if miss, read DB and populate cache. Most common. |
+| Read-through | Cache library transparently goes to DB. Less common. |
+| Write-through | Writes go to cache and DB simultaneously. Used for write-heavy. |
+| Write-behind | Writes go to cache, async to DB. Risky — data loss on crash. |
+
+We use **cache-aside** with an in-memory dict (Python `cachetools`). Mention Redis as the multi-worker upgrade.
+
+## Walkthrough
+
+### Step 1 — Install dependencies
+
+```bash
+uv add slowapi cachetools
+```
+
+### Step 2 — Rate limit the login endpoint
+
+slowapi tracks state per `Limiter` instance, so the route decorator and the app must share **the same instance**. We export a single one from a small core module:
+
+```python app/core/rate_limit.py
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address, default_limits=[])
+```
+
+```python app/main.py
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from app.core.rate_limit import limiter   # the single shared instance
+
+
+def create_app():
+    app = FastAPI(...)
+
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+    # ... rest of setup
+```
+
+```python app/routers/auth.py
+from fastapi import Request
+
+from app.core.rate_limit import limiter   # the SAME instance, not a fresh Limiter()
+
+
+@router.post("/login", response_model=TokenPair)
+@limiter.limit("5/minute")  # max 5 login attempts per IP per minute
+async def login(
+    request: Request,         # ← needed for rate-limit middleware
+    payload: LoginRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    access, refresh = await auth_service.login(db, payload.email, payload.password)
+    return TokenPair(access_token=access, refresh_token=refresh)
+```
+
+### Step 3 — Try it
+
+```bash
+for i in {1..7}; do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:8000/api/v1/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"wrong@x.com","password":"x"}'
+done
+# 401 401 401 401 401 429 429
+#                            ↑ 429 Too Many Requests after 5
+```
+
+### Step 4 — Add a cache for site lookups
+
+Sites change rarely; we hit `GET /sites/{site_id}` on most screening submissions.
+
+```python app/cache/__init__.py
+# empty
+```
+
+```python app/cache/sites.py
+"""In-memory cache for sites. TTL-based; auto-evicts.
+
+For multi-worker deploys, swap `TTLCache` for `aioredis`-backed wrapper.
+"""
+from cachetools import TTLCache
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.site import Site
+from app.repositories import site_repository
+
+_site_cache: TTLCache = TTLCache(maxsize=1000, ttl=60)
+
+
+async def get_site_cached(db: AsyncSession, site_id: str) -> Site | None:
+    """Cache-aside: try cache, fall back to DB, populate on miss."""
+    cached = _site_cache.get(site_id)
+    if cached is not None:
+        return cached
+    site = await site_repository.get_by_id(db, site_id)
+    if site is not None:
+        _site_cache[site_id] = site
+    return site
+
+
+def invalidate_site(site_id: str) -> None:
+    """Evict on writes. Call this when sites change."""
+    _site_cache.pop(site_id, None)
+```
+
+### Step 5 — Use it in the service
+
+```python app/services/screening_service.py
+from app.cache import sites as site_cache
+
+
+async def submit_screening(uow, runner, progress, *, user, payload):
+    async with uow:
+        await permission_service.ensure_can_submit_for_site(uow.session, user, payload.site_id)
+        site = await site_cache.get_site_cached(uow.session, payload.site_id)
+        if site is None or not site.active:
+            raise InvalidSite(...)
+        # ... rest
+```
+
+### Step 6 — Invalidate on writes
+
+If we ever build a "deactivate site" endpoint:
+
+```python
+async def deactivate_site(uow, site_id: str):
+    async with uow:
+        site = await site_repository.get_by_id(uow.session, site_id)
+        site.active = False
+    site_cache.invalidate_site(site_id)   # ← important
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`@limiter.limit('5/minute')` syntax">
+    `slowapi`'s declarative format. Other examples: `"100/hour"`, `"10/second"`. Combine: `["5/minute", "1000/hour"]` for tiered limits.
+  </Accordion>
+  <Accordion title="Why is `request: Request` required for the rate-limited route?">
+    `slowapi` introspects the request to read the IP. Without that param, it can't enforce the limit.
+  </Accordion>
+  <Accordion title="`TTLCache(maxsize=1000, ttl=60)`">
+    Holds at most 1000 entries; each expires 60 seconds after insert. Eviction happens on access (lazy).
+  </Accordion>
+  <Accordion title="What about the 'thundering herd' on cache miss?">
+    1000 concurrent requests for the same key, all missing the cache, all hitting the DB. Mitigation: per-key locking (only one DB call per key in flight). For our app: not worth implementing yet — but Redis solutions like `redis-cache` handle this natively.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Brute-force test on login">
+    Run the 7-attempt loop from Step 3. Confirm rate limit kicks in.
+  </Step>
+  <Step title="Cache hit/miss observation">
+    Add a temporary print in `get_site_cached`:
+    ```python
+    print(f"cache {'HIT' if cached is not None else 'MISS'}: {site_id}")
+    ```
+    Submit two screenings for the same site in quick succession. Observe one MISS, one HIT.
+    Remove the print after testing.
+  </Step>
+  <Step title="Cache TTL expiration">
+    Submit, wait 65 seconds, submit again. The second is a MISS again — TTL did its job.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I rate-limit every endpoint?">
+    No. Rate-limit endpoints prone to abuse (login, password reset, signup, public reads). Internal authenticated endpoints are usually fine — auth itself is the rate limit (you can't spam unless you've stolen a token).
+  </Accordion>
+  <Accordion title="By IP or by user?">
+    Login is by IP (no user yet). Authenticated endpoints by user (so multiple users behind one NAT aren't penalized for each other). `slowapi` lets you swap `key_func`.
+  </Accordion>
+  <Accordion title="When should I move to Redis?">
+    The moment you scale beyond one process. With multiple workers, in-memory state is per-worker — a user can still get 5×N attempts (one per worker). Redis gives you a single source of truth.
+  </Accordion>
+  <Accordion title="What if the cache becomes stale?">
+    Two strategies: (1) **TTL** (we use this) — accept up to TTL seconds of staleness; (2) **invalidation** (we also use this) — explicit `invalidate_site` after writes. Combine them.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Cache the **screening lookup** with a 5-second TTL.
+
+    1. Create `app/cache/screenings.py` with `get_screening_cached(db, screening_id)`.
+    2. Call it from `screening_service.get_screening` instead of `repo.get_by_id`.
+    3. Add `invalidate_screening(screening_id)` and call it in `mark_enrolled`, `update_status`, `delete`.
+
+    Why short TTL: screenings change *fast* during the eligibility pipeline (status transitions). 5 seconds is a sweet spot — enough to absorb retry-bursts from clients polling status, short enough that stale state is rarely user-visible.
+  </Tab>
+  <Tab title="Hint">
+    Mirror `cache/sites.py`. Cache invalidation on every state-changing repo call is the discipline.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/19-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Cache invalidation is the hard part.** Adding the cache is 10 lines. Forgetting to invalidate after a write — and shipping stale data to a user — is the bug everyone makes once. The discipline: every write path that mutates a cached entity calls `invalidate_X`. Make it a code-review checklist item.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub has neither rate limiting nor caching. Both would be reasonable additions for production scale.
+
+## Next module
+
+<Card title="Module 20: Structured logging" icon="book" href="/modules/20-logging">
+  Make logs queryable, with correlation IDs threading through the entire request and worker.
+</Card>

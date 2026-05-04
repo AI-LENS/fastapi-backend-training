@@ -1,0 +1,57 @@
+---
+title: "27 · Solution"
+description: "Idempotent enroll endpoint."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/routers/screenings.py
+@router.post("/{screening_id}/enroll")
+async def enroll(
+    screening_id: UUID,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+    db: AsyncSession = Depends(get_db_session),
+    idem_key: str | None = Depends(get_idempotency_key),
+):
+    async def _perform():
+        screening = await service.enroll_screening(uow, screening_id=screening_id, user=user)
+        return 200, ScreeningResponse.model_validate(screening).model_dump(mode="json")
+
+    if idem_key:
+        return await idempotency.get_or_store(
+            db, key=idem_key, route=f"POST /screenings/{screening_id}/enroll",
+            perform=_perform,
+        )
+    status, body = await _perform()
+    return JSONResponse(status_code=status, content=body)
+```
+
+## Verify
+
+```bash
+KEY=$(uuidgen)
+
+# Enroll the eligible screening twice with the same key
+curl -X POST -H "Authorization: Bearer $ALICE" -H "Idempotency-Key: $KEY" \
+  http://localhost:8000/api/v1/screenings/$ELIGIBLE_ID/enroll | jq .subject_id
+
+curl -X POST -H "Authorization: Bearer $ALICE" -H "Idempotency-Key: $KEY" \
+  http://localhost:8000/api/v1/screenings/$ELIGIBLE_ID/enroll | jq .subject_id
+
+# Both return the same subject_id. No error from AlreadyEnrolled.
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why include `screening_id` in the route key?">
+    Same idempotency key for two different enroll attempts (different screenings) shouldn't collide. The route+key composite keeps them separate.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 28: Task queues at scale" icon="rocket" href="/modules/28-task-queues" />

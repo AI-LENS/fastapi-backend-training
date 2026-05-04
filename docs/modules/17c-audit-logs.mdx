@@ -1,0 +1,459 @@
+---
+title: "17c · Audit logs"
+description: "Tamper-evident, append-only event trail. Different from app logs — and equally critical."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** Every security-relevant action records an immutable audit entry. Queryable. Hash-chained for tamper detection.
+</Tip>
+
+## Concept
+
+Application logs (Module 20) are for **debugging**. They're verbose, mutable, ephemeral, and often deleted after 7 days.
+
+**Audit logs are different**:
+
+<CardGroup cols={3}>
+  <Card title="Append-only" icon="shield">
+    Once written, never modified. Never deleted (except per retention policy).
+  </Card>
+  <Card title="Tamper-evident" icon="key">
+    Each entry hashes the prior one. A modified entry breaks the chain — proof of tampering.
+  </Card>
+  <Card title="Compliance-grade" icon="book">
+    Required by HIPAA, SOC 2, GDPR, etc. Not optional.
+  </Card>
+</CardGroup>
+
+### What goes in an audit log
+
+| Audit | Don't audit |
+|---|---|
+| Login (success/failure) | Every list endpoint hit |
+| User created/updated/disabled | Heartbeat / health checks |
+| Role change | Internal queries |
+| Screening submitted/enrolled/cancelled | Stage-by-stage pipeline progress |
+| Permission denied (403) | Successful auth (token validation) |
+| Admin action (DLQ retry, etc.) | Static asset reads |
+
+**The rule:** if you'd want it to investigate a suspected breach, audit it. Otherwise, app log.
+
+### Tamper-evidence with hash chaining
+
+Each entry stores `hash = sha256(prev_hash + this_entry_json)`. Modifying any entry breaks the chain from that point forward. Add a periodic verification job and any tampering surfaces automatically.
+
+This is the same pattern blockchains use — for the same reason.
+
+## Walkthrough
+
+### Step 1 — Audit log model
+
+```python app/models/audit_log.py
+"""Append-only, hash-chained audit log."""
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+from sqlalchemy import DateTime, Integer, JSON, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    seq: Mapped[int] = mapped_column(Integer, autoincrement=True, unique=True, index=True, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),  # tz-aware to match the column type
+        index=True,
+    )
+
+    actor_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    actor_role: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    action: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    resource_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    resource_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # `metadata` is reserved on `DeclarativeBase` (it's the MetaData registry), so
+    # the column is named `event_metadata`. Reference it by that name everywhere.
+    event_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    entry_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+```
+
+Migrate: `alembic revision --autogenerate -m "add audit_logs" && alembic upgrade head`.
+
+### Step 2 — Audit repository (append-only)
+
+```python app/repositories/audit_repository.py
+"""Append-only repo. Deliberately exposes no UPDATE or DELETE methods."""
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.audit_log import AuditLog
+
+
+def _compute_hash(prev_hash: str | None, payload: dict) -> str:
+    """sha256 over (prev_hash || canonical-JSON of payload)."""
+    canonical = json.dumps(payload, sort_keys=True, default=str).encode()
+    h = hashlib.sha256()
+    if prev_hash:
+        h.update(prev_hash.encode())
+    h.update(canonical)
+    return h.hexdigest()
+
+
+async def append(
+    db: AsyncSession,
+    *,
+    actor_id: str | None,
+    actor_role: str | None,
+    action: str,
+    resource_type: str,
+    resource_id: str,
+    metadata: dict[str, Any] | None = None,
+) -> AuditLog:
+    """Add a new audit entry. Hash-chains to the previous one."""
+    event_metadata = metadata or {}
+    occurred_at = datetime.now(timezone.utc)
+
+    # Get the previous entry's hash (if any)
+    last_stmt = select(AuditLog).order_by(desc(AuditLog.seq)).limit(1)
+    last = (await db.execute(last_stmt)).scalars().first()
+    prev_hash = last.entry_hash if last else None
+
+    payload = {
+        "occurred_at": occurred_at,
+        "actor_id": actor_id,
+        "actor_role": actor_role,
+        "action": action,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "event_metadata": event_metadata,
+    }
+    entry_hash = _compute_hash(prev_hash, payload)
+
+    entry = AuditLog(
+        occurred_at=occurred_at,
+        actor_id=actor_id,
+        actor_role=actor_role,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        event_metadata=event_metadata,
+        prev_hash=prev_hash,
+        entry_hash=entry_hash,
+    )
+    db.add(entry)
+    await db.flush()
+    return entry
+
+
+async def list_filtered(
+    db: AsyncSession,
+    *,
+    actor_id: str | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    action: str | None = None,
+    limit: int = 100,
+) -> list[AuditLog]:
+    stmt = select(AuditLog).order_by(desc(AuditLog.seq)).limit(limit)
+    if actor_id:
+        stmt = stmt.where(AuditLog.actor_id == actor_id)
+    if resource_type:
+        stmt = stmt.where(AuditLog.resource_type == resource_type)
+    if resource_id:
+        stmt = stmt.where(AuditLog.resource_id == resource_id)
+    if action:
+        stmt = stmt.where(AuditLog.action == action)
+    return list((await db.execute(stmt)).scalars().all())
+
+
+async def verify_chain(db: AsyncSession, *, batch_size: int = 1000) -> tuple[bool, int | None]:
+    """Walk the chain, verifying each entry's hash. Returns (ok, broken_seq)."""
+    offset = 0
+    prev_hash: str | None = None
+    while True:
+        stmt = (
+            select(AuditLog)
+            .order_by(AuditLog.seq.asc())
+            .offset(offset)
+            .limit(batch_size)
+        )
+        batch = list((await db.execute(stmt)).scalars().all())
+        if not batch:
+            return True, None
+        for entry in batch:
+            payload = {
+                "occurred_at": entry.occurred_at,
+                "actor_id": entry.actor_id,
+                "actor_role": entry.actor_role,
+                "action": entry.action,
+                "resource_type": entry.resource_type,
+                "resource_id": entry.resource_id,
+                "event_metadata": entry.event_metadata,
+            }
+            expected = _compute_hash(prev_hash, payload)
+            if entry.entry_hash != expected or entry.prev_hash != prev_hash:
+                return False, entry.seq
+            prev_hash = entry.entry_hash
+        offset += batch_size
+```
+
+### Step 3 — Wire into the service
+
+```python app/services/screening_service.py
+from app.repositories import audit_repository as audit
+
+
+async def submit_screening(uow, runner, progress, *, user, payload):
+    if user.role == "coordinator" and user.site_id != payload.site_id:
+        raise Forbidden(...)
+
+    async with uow:
+        # ... validate site ...
+        screening = await repo.create(uow.session, **payload.model_dump())
+
+        await audit.append(
+            uow.session,
+            actor_id=str(user.id),
+            actor_role=user.role,
+            action="screening.submitted",
+            resource_type="screening",
+            resource_id=str(screening.id),
+            metadata={"site_id": screening.site_id, "candidate_initials": screening.candidate_initials},
+        )
+
+        uow.publish_after_commit(...)
+        return screening
+
+
+async def enroll_screening(uow, *, screening_id, user):
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None or not permissions.can_access_screening(user, screening):
+            raise ScreeningNotFound(...)
+        if not permissions.can_modify_screening(user, screening):
+            raise Forbidden(...)
+        # ... validation ...
+
+        subject_id = _generate_subject_id()
+        await repo.mark_enrolled(uow.session, screening, subject_id=subject_id)
+
+        await audit.append(
+            uow.session,
+            actor_id=str(user.id),
+            actor_role=user.role,
+            action="screening.enrolled",
+            resource_type="screening",
+            resource_id=str(screening_id),
+            metadata={"subject_id": subject_id, "site_id": screening.site_id},
+        )
+
+        return screening
+```
+
+The audit row commits in the **same transaction** as the business write. Atomic. Either both happen or neither does — no orphaned audits.
+
+### Step 4 — Audit auth events
+
+```python app/services/auth_service.py
+async def login(db, email, password):
+    # Note: `audit.append` only flushes the new row; we now have a write to commit.
+    # Module 16's `login` had no writes, so an explicit commit here is a deliberate
+    # behavior change. If your `get_db_session` already commits on yield-end, drop
+    # these explicit commits.
+    user = await user_repo.get_by_email(db, email)
+    if user is None or not user.is_active or not verify_password(password, user.hashed_password):
+        # Log failed login (no actor_id since we don't trust the email)
+        await audit.append(
+            db,
+            actor_id=None,
+            actor_role=None,
+            action="auth.login_failed",
+            resource_type="auth",
+            resource_id="login",
+            metadata={"email_attempted": email},
+        )
+        await db.commit()
+        raise InvalidCredentials("Invalid email or password")
+
+    await audit.append(
+        db,
+        actor_id=str(user.id),
+        actor_role=user.role,
+        action="auth.login_succeeded",
+        resource_type="user",
+        resource_id=str(user.id),
+        metadata={},
+    )
+    await db.commit()
+
+    return issue_access_token(user), issue_refresh_token(user)
+```
+
+### Step 5 — Admin endpoints to query audit
+
+```python app/routers/admin.py
+# Append to the `app/routers/admin.py` you wrote in Module 17 (Step 3).
+# Cumulative imports at top of the file:
+#   from fastapi import APIRouter, Depends
+#   from sqlalchemy.ext.asyncio import AsyncSession
+#   from app.dependencies import get_db_session, require_role
+from app.repositories import audit_repository as audit
+
+
+@router.get("/audit")
+async def list_audit(
+    actor_id: str | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    action: str | None = None,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db_session),
+):
+    rows = await audit.list_filtered(
+        db,
+        actor_id=actor_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        action=action,
+        limit=limit,
+    )
+    return [
+        {
+            "seq": r.seq,
+            "occurred_at": r.occurred_at,
+            "actor_id": r.actor_id,
+            "actor_role": r.actor_role,
+            "action": r.action,
+            "resource_type": r.resource_type,
+            "resource_id": r.resource_id,
+            "metadata": r.event_metadata,   # column is `event_metadata`; expose as "metadata" in JSON
+            "entry_hash": r.entry_hash,
+            "prev_hash": r.prev_hash,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/audit/verify")
+async def verify_audit_chain(db: AsyncSession = Depends(get_db_session)):
+    ok, broken_seq = await audit.verify_chain(db)
+    return {"chain_intact": ok, "broken_at_seq": broken_seq}
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why hash-chain? Wouldn't a digital signature be better?">
+    Signatures need a key infrastructure (rotation, storage, revocation) — overkill for in-app audit. Hash chaining gives you tamper-evidence cheaply. Sign the hash chain *root* (latest hash) with an external system or key for non-repudiation; that hybrid is the production sweet spot.
+  </Accordion>
+  <Accordion title="What if two writes race for the next `seq`?">
+    The DB serializes inserts (sequential `seq` is a unique constraint). The losing write retries. For high-throughput audits you'd batch via an in-memory channel + a single writer process. Most apps never hit that ceiling.
+  </Accordion>
+  <Accordion title="Why is the audit row in the same transaction as the business write?">
+    The whole point: "you cannot enroll a subject without an audit entry, full stop". If the business commits but the audit fails, you've broken the contract. Single transaction = guarantee.
+  </Accordion>
+  <Accordion title="What about logs the user shouldn't see (e.g., the failed login leaks the email tried)?">
+    Audit logs are **internal**. Only sponsors/admins see them. Never expose the audit endpoint to coordinators. The metadata can include sensitive info (email attempts, IP addresses) for forensics — that's the whole point.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit and enroll a screening">
+    Login as Alice, submit, wait for eligibility, enroll. Three actions.
+  </Step>
+  <Step title="Query the audit log as admin">
+    ```bash
+    curl -H "Authorization: Bearer $ADMIN" 'http://localhost:8000/api/v1/admin/audit?limit=10' | jq
+    ```
+    See the entries — `screening.submitted`, `screening.enrolled` — with metadata and hashes.
+  </Step>
+  <Step title="Verify the chain">
+    ```bash
+    curl -X POST -H "Authorization: Bearer $ADMIN" http://localhost:8000/api/v1/admin/audit/verify
+    # {"chain_intact": true, "broken_at_seq": null}
+    ```
+  </Step>
+  <Step title="Tamper with a row">
+    ```bash
+    sqlite3 enrollment.db "UPDATE audit_logs SET metadata=json_set(metadata, '$.tampered', 'yes') WHERE seq=1"
+    ```
+    Then re-verify:
+    ```bash
+    curl -X POST ... /audit/verify
+    # {"chain_intact": false, "broken_at_seq": 1}
+    ```
+    The chain is broken from row 1 onward — exactly what we want.
+  </Step>
+  <Step title="Heal it (don't do this in production)">
+    Restart the app, do a fresh write — the new entry chains from the corrupted hash, but the corruption marker stays detectable forever.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I audit every read too?">
+    Per HIPAA, accessing PHI typically must be audited. For non-PHI systems, reads are usually skipped (volume). For the training app: skip reads. For real medical systems: audit them.
+  </Accordion>
+  <Accordion title="What's the volume implication?">
+    1 audit per business action. For our app, ~3 per screening. Tiny. For a high-traffic system: shard by date, partition the table, or stream to a separate audit DB.
+  </Accordion>
+  <Accordion title="Can the audit log get out of sync with reality?">
+    Only if a write happens *outside* the service layer (raw SQL by a DBA, manual DB manipulation). Document the rule: "all writes go through services". Periodic verification jobs catch drift.
+  </Accordion>
+  <Accordion title="What about retention?">
+    Per regulation. HIPAA: 6 years minimum. SOC 2: depends on policy. Add a `purged_at` column or move old entries to cold storage rather than deleting.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Audit the **denied** access too.
+
+    Currently we audit successes. Add audit entries for:
+    - `screening.access_denied` — when `can_access_screening` returns False
+    - `screening.modify_denied` — when `can_modify_screening` returns False
+
+    Both should be written *before* raising the exception, with `metadata={"requested_id": ..., "user_site": ...}`.
+
+    Why: failed access attempts are the strongest signal of a probing attacker. You want them in the audit chain.
+  </Tab>
+  <Tab title="Hint">
+    Add the audit append in the same `async with uow:` block, before the raise.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/17c-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The audit log is your "what happened" receipt for incidents.** When a security event is suspected six months from now, this table is the source of truth. You will never regret writing more to it than you needed; you will absolutely regret writing less. When in doubt, audit.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub doesn't have an audit table — a real gap for a clinical app. The pattern shown here is what HIPAA auditors expect to see in any production CRF or EDC system.
+
+## Next module
+
+<Card title="Module 18: Middleware" icon="link" href="/modules/18-middleware">
+  CORS, request IDs, request logging — the cross-cutting layer.
+</Card>

@@ -1,0 +1,83 @@
+---
+title: "17c · Solution"
+description: "Audit denied access attempts."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/services/screening_service.py
+async def get_screening(uow, *, screening_id: UUID, user: User) -> Screening:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        if not permissions.can_access_screening(user, screening):
+            await audit.append(
+                uow.session,
+                actor_id=str(user.id),
+                actor_role=user.role,
+                action="screening.access_denied",
+                resource_type="screening",
+                resource_id=str(screening_id),
+                metadata={
+                    "user_site": user.site_id,
+                    "screening_site": screening.site_id,
+                },
+            )
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        return screening
+
+
+async def cancel_screening(uow, *, screening_id, user):
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None or not permissions.can_access_screening(user, screening):
+            # Same audit-deny pattern
+            ...
+            raise ScreeningNotFound(...)
+        if not permissions.can_modify_screening(user, screening):
+            await audit.append(
+                uow.session,
+                actor_id=str(user.id),
+                actor_role=user.role,
+                action="screening.modify_denied",
+                resource_type="screening",
+                resource_id=str(screening_id),
+                metadata={
+                    "operation": "cancel",
+                    "user_site": user.site_id,
+                    "screening_site": screening.site_id,
+                },
+            )
+            raise Forbidden("You cannot modify this screening")
+        # ... rest
+```
+
+## Why this matters
+
+A single `screening.modify_denied` is noise. Twenty in five minutes from the same actor is a clear probe pattern — and now you can detect it with a query:
+
+```sql
+SELECT actor_id, action, COUNT(*)
+FROM audit_logs
+WHERE action LIKE '%_denied'
+  AND occurred_at > now() - interval '5 minutes'
+GROUP BY actor_id, action
+HAVING COUNT(*) > 5;
+```
+
+Module 26c (monitoring) wires alerts on top of patterns like this.
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="The audit row commits even though the business operation is rejected — is that right?">
+    Yes — that's the whole point. We *want* to record "Alice tried to read Bob's screening at this time". The transaction commits the audit row; the exception propagates after. Two outcomes happen in one atomic step: the audit is recorded, and the operation is rejected.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 18: Middleware" icon="link" href="/modules/18-middleware" />

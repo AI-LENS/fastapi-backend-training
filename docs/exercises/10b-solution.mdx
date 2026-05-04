@@ -1,0 +1,87 @@
+---
+title: "10b · Solution"
+description: "Refactor cancel and update_eligibility to UnitOfWork."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Service
+
+```python app/services/screening_service.py
+async def cancel_screening(uow: UnitOfWork, screening_id: UUID) -> None:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        if screening.status != "submitted":
+            raise CannotDelete(
+                f"Cannot delete screening in status {screening.status}"
+            )
+        await repo.delete(uow.session, screening)
+
+
+async def update_eligibility(
+    uow: UnitOfWork,
+    screening_id: UUID,
+    *,
+    eligible: bool,
+    failed_criteria: list[str],
+) -> Screening:
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        if screening.status in {"enrolled", "ineligible"}:
+            raise AlreadyDecided(f"Screening is in status {screening.status}")
+
+        new_status = "eligible" if eligible else "ineligible"
+        return await repo.update_status(
+            uow.session,
+            screening,
+            status=new_status,
+            eligibility_result=new_status,
+            failed_criteria=failed_criteria,
+        )
+```
+
+## Routes
+
+```python app/routers/screenings.py
+@router.delete("/{screening_id}", status_code=204)
+async def delete_screening(screening_id: UUID, uow: UnitOfWork = Depends(get_uow)):
+    await service.cancel_screening(uow, screening_id)
+
+
+@router.post("/{screening_id}/_set_eligibility", response_model=ScreeningResponse)
+async def set_eligibility(
+    screening_id: UUID,
+    payload: EligibilityUpdate,
+    uow: UnitOfWork = Depends(get_uow),
+):
+    return await service.update_eligibility(
+        uow,
+        screening_id,
+        eligible=payload.eligible,
+        failed_criteria=payload.failed_criteria,
+    )
+```
+
+## Repo `delete` should not commit
+
+```python app/repositories/screening_repository.py
+async def delete(db: AsyncSession, screening: Screening) -> None:
+    await db.delete(screening)
+    await db.flush()  # not commit — UoW commits
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="What if `cancel_screening` is called and the screening was already cancelled by another request?">
+    Race conditions exist. For now, this is "best effort" — the second call gets `ScreeningNotFound`. Production: use optimistic locking (`SELECT ... FOR UPDATE` or version columns), introduced briefly in Module 27.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 11: Custom exceptions" icon="shield" href="/modules/11-exceptions" />

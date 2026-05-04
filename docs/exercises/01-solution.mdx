@@ -1,0 +1,86 @@
+---
+title: "01 · Solution"
+description: "Reference solution for the Module 01 exercise."
+---
+
+<Warning>
+  **Don't read this until you've tried the exercise.** Struggling for 5 minutes teaches more than reading the answer immediately.
+</Warning>
+
+## The exercise
+
+Add a `GET /sites/{site_id}` endpoint that echoes the `site_id` and returns hardcoded `name` and `active` fields.
+
+## Reference solution
+
+```python app/main.py {15-21}
+"""Subject Enrollment Service — entry point."""
+from fastapi import FastAPI
+
+app = FastAPI(
+    title="Subject Enrollment Service",
+    description="Clinical trial enrollment training app",
+    version="0.1.0",
+)
+
+
+@app.get("/")
+def root():
+    """Service banner — also acts as a basic liveness check."""
+    return {
+        "service": "Subject Enrollment Service",
+        "version": "0.1.0",
+        "status": "ok",
+    }
+
+
+@app.get("/sites/{site_id}")
+def get_site(site_id: str):
+    """Return information about a site (hardcoded for now)."""
+    return {
+        "site_id": site_id,
+        "name": "Example Hospital",
+        "active": True,
+    }
+```
+
+## What to notice
+
+<AccordionGroup>
+  <Accordion title="The path parameter name MUST match the function argument name">
+    `{site_id}` in the route string and `site_id: str` in the function signature must use the **exact same name**. If you mismatch them (e.g., `{site_id}` and `def get_site(id: str)`), FastAPI raises an error at startup.
+  </Accordion>
+  <Accordion title="Why `: str`?">
+    Two reasons:
+
+    1. **Validation** — FastAPI converts the URL fragment to a string. If you wrote `site_id: int` and the URL was `/sites/SITE-001`, FastAPI returns a 422 error automatically.
+    2. **Docs** — the type appears in `/docs` so consumers know what to send.
+  </Accordion>
+  <Accordion title="Could I have returned a Pydantic model instead of a dict?">
+    Yes, and that's what we do in Module 02. Returning dicts works but loses two things: typed responses (your editor doesn't know the shape), and a documented response schema (Swagger shows `{}` instead of fields). Module 02 fixes both.
+  </Accordion>
+  <Accordion title="What if I want optional path-like parameters?">
+    Path parameters are always required. For optional values, use **query parameters** (`?key=value`) — covered in Module 03.
+  </Accordion>
+</AccordionGroup>
+
+## Common mistakes
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| Forgot `{site_id}` braces | Route returns 404 for any ID | Use `@app.get("/sites/{site_id}")` |
+| Used different names in route vs signature | Server fails to start | Match the names exactly |
+| Returned `site_id` not `{"site_id": site_id}` | Response is `"SITE-001"` not `{"site_id": "SITE-001"}` | Wrap it in a dict |
+| No `--reload` on uvicorn | Changes don't appear | Restart with `--reload` |
+
+## Variations to explore (optional)
+
+- Add a third endpoint `GET /health` that returns `{"status": "ok"}`. Module 04 formalizes this as a "liveness probe".
+- Pass `site_id: int` and try hitting `/sites/abc` — observe the 422 error FastAPI returns.
+- Add `description="..."` to the decorator: `@app.get("/sites/{site_id}", description="Look up a site by ID")` — see how it appears in `/docs`.
+
+## Next module
+
+<Card title="Module 02: Pydantic schemas" icon="puzzle-piece" href="/modules/02-pydantic-schemas">
+  Replace these dicts with proper typed request/response models.
+</Card>

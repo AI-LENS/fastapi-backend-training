@@ -1,0 +1,279 @@
+---
+title: "04 · Project structure"
+description: "Folder layout, app factory, lifespan, configuration via pydantic-settings."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~10 lines · **Outcome:** Production-shaped layout. Settings via `.env`. Startup/shutdown hooks. API versioning.
+</Tip>
+
+## Concept
+
+You've got `app/main.py`, `app/routers/`, `app/schemas/`. Time to make this the **canonical layout** every senior FastAPI engineer expects.
+
+```
+app/
+├── __init__.py
+├── main.py              ← thin entrypoint, app factory
+├── config.py            ← Settings (pydantic-settings)
+├── routers/             ← API layer
+├── schemas/             ← Pydantic contracts
+├── services/            ← (Module 09) business logic
+├── repositories/        ← (Module 08) data access
+├── models/              ← (Module 06) DB tables
+├── workers/             ← (Module 13) background tasks
+├── pipelines/           ← (Module 14) processing
+└── dependencies.py      ← (Module 10) DI providers
+```
+
+We add the empty folders now (with `__init__.py`s) so the structure is in place when each module needs it.
+
+### Three patterns this module introduces
+
+<CardGroup cols={3}>
+  <Card title="App factory" icon="server">
+    `create_app()` returns a configured `FastAPI` instance. Critical for testing — each test gets its own clean app.
+  </Card>
+  <Card title="Lifespan" icon="rocket">
+    A context manager wrapping startup/shutdown. Replaces deprecated `@app.on_event("startup")`.
+  </Card>
+  <Card title="Settings" icon="gear">
+    `pydantic-settings` loads config from env vars and `.env`. Fail-fast at startup if config is wrong.
+  </Card>
+</CardGroup>
+
+## Walkthrough
+
+### Step 1 — Install pydantic-settings
+
+```bash
+uv add pydantic-settings
+```
+
+### Step 2 — Create the Settings class
+
+```python app/config.py
+"""Application configuration via pydantic-settings.
+
+Settings are loaded in this priority order (later wins):
+  1. Defaults declared on the class
+  2. Values in `.env`
+  3. Environment variables
+"""
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        env_prefix="ENROLLMENT_",
+        case_sensitive=False,
+    )
+
+    # App identity
+    app_name: str = "Subject Enrollment Service"
+    app_version: str = "0.4.0"
+    api_prefix: str = "/api/v1"
+
+    # CORS
+    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:8000"]
+
+    # Logging
+    log_level: str = "INFO"
+
+
+settings = Settings()
+```
+
+### Step 3 — Create `.env.example` and `.env`
+
+```bash .env.example
+# Copy this to .env and edit. Never commit .env itself.
+ENROLLMENT_LOG_LEVEL=INFO
+ENROLLMENT_API_PREFIX=/api/v1
+```
+
+```bash
+cp .env.example .env
+```
+
+`.env` is already gitignored.
+
+### Step 4 — Add the lifespan and app factory
+
+```python app/main.py
+"""Subject Enrollment Service — entry point."""
+import logging
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.config import settings
+from app.routers import screenings, sites
+
+
+logging.basicConfig(
+    level=settings.log_level,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting %s v%s", settings.app_name, settings.app_version)
+    yield
+    # Shutdown
+    logger.info("Shutting down")
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title=settings.app_name,
+        version=settings.app_version,
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(sites.router, prefix=settings.api_prefix)
+    app.include_router(screenings.router, prefix=settings.api_prefix)
+
+    @app.get("/")
+    def root():
+        return {"service": settings.app_name, "version": settings.app_version}
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    return app
+
+
+app = create_app()
+```
+
+### Step 5 — Create the placeholder folders
+
+```bash
+mkdir -p app/services app/repositories app/models app/workers app/pipelines
+touch app/services/__init__.py app/repositories/__init__.py
+touch app/models/__init__.py app/workers/__init__.py app/pipelines/__init__.py
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`@asynccontextmanager` lifespan">
+    Code before `yield` runs at startup. Code after `yield` runs at shutdown. The old `@app.on_event("startup")` is deprecated — don't use it. Lifespan also handles errors better; an exception during startup prevents the app from starting at all.
+  </Accordion>
+  <Accordion title="Why a `create_app()` factory?">
+    **Testing.** With a single global `app`, all your tests share state. With a factory, every test calls `create_app()` and gets a clean app. We exploit this hard in Module 23.
+  </Accordion>
+  <Accordion title="`env_prefix='ENROLLMENT_'`">
+    Means env vars must start with `ENROLLMENT_` to be picked up — so `ENROLLMENT_LOG_LEVEL=DEBUG`, not `LOG_LEVEL=DEBUG`. This prevents accidental collisions with system env vars.
+  </Accordion>
+  <Accordion title="`api_prefix=/api/v1` — why version the API?">
+    So you can ship `v2` later without breaking `v1` clients. URL-based versioning (`/api/v1/...`) is the simplest pattern and the one most production teams use.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart Uvicorn">
+    The lifespan log line should appear: `Starting Subject Enrollment Service v0.4.0`.
+  </Step>
+  <Step title="Endpoints moved to /api/v1">
+    ```bash
+    curl http://localhost:8000/api/v1/sites
+    curl http://localhost:8000/api/v1/screenings
+    ```
+    The old paths (`/sites`) now return 404 — `/docs` shows the new prefix.
+  </Step>
+  <Step title="Override a setting via env">
+    Stop Uvicorn, then:
+    ```bash
+    ENROLLMENT_LOG_LEVEL=DEBUG uvicorn app.main:app --reload --port 8000
+    ```
+    Logs are noisier — you've changed config without editing code.
+  </Step>
+  <Step title="Health endpoint">
+    ```bash
+    curl http://localhost:8000/health
+    ```
+    Returns `{"status": "ok"}`. We'll make it smarter in Module 26 (readiness probes).
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What if I forget to set an `ENROLLMENT_` env var?">
+    Whatever default you declared on the class is used. If you have **no default** (`field: str` with no `=`), the app fails to start with a validation error. That's good — fail fast, not late.
+  </Accordion>
+  <Accordion title="Do I need both `.env` and env vars?">
+    No, either works. `.env` is convenient for local dev (you don't have to remember to export). Env vars are how production injects config (Docker, Kubernetes, etc.). Module 24 covers the layering in detail.
+  </Accordion>
+  <Accordion title="Why `app = create_app()` at the bottom?">
+    Uvicorn's `app.main:app` import path needs *something* called `app`. The factory creates one for normal runs. Tests create their own via `create_app()` directly without importing the global.
+  </Accordion>
+  <Accordion title="What goes in `app.state`?">
+    Long-lived shared resources — DB engines, executors, clients. Set them in lifespan. Module 13 introduces `app.state.task_runner`. Don't store request data there; that's what request scope is for.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a configurable **page-size limit** to settings, and use it as the default in your screening list.
+
+    1. Add `default_list_limit: int = 50` to `Settings`.
+    2. In `screenings.py`, change the `list_screenings` function so the `limit` query parameter **defaults to `settings.default_list_limit`** instead of `50`.
+    3. Confirm you can override it: `ENROLLMENT_DEFAULT_LIST_LIMIT=10 uvicorn ...` then `GET /api/v1/screenings` returns at most 10.
+
+    You'll write 2–3 lines.
+  </Tab>
+  <Tab title="Hint">
+    `limit: int = settings.default_list_limit` — Python evaluates default arg values once at import, but since `settings` is module-level it's resolved before the route is registered. To dynamically read it per-request you'd use `Depends`, but for module-level config the static read is fine.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/04-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+ENROLLMENT_DEFAULT_LIST_LIMIT=2 uvicorn app.main:app --port 8000
+# (in another terminal, submit 5 screenings, then:)
+curl http://localhost:8000/api/v1/screenings | python3 -m json.tool
+# Expect 2 items max
+```
+
+## Insight
+
+<Tip>
+  **The factory + lifespan + settings combo is what makes a FastAPI app *operable*.** Without these, every config change means a code change, every test sees stale state, and startup errors silently leave you with a half-running server. With them, the same code base runs identically in dev, CI, and prod with just env vars changing.
+</Tip>
+
+## Real-world reference
+
+- `Final CRF Annotation/annotate-hub-api/app/main.py:75-134` — `create_app()`
+- `Final CRF Annotation/annotate-hub-api/app/main.py:24-72` — lifespan with migrations + admin seeding (we'll get to those!)
+- `Final CRF Annotation/annotate-hub-api/app/config.py` — settings
+
+## Next module
+
+<Card title="Module 05: SQLAlchemy" icon="database" href="/modules/05-sqlalchemy">
+  Time for a real database. Engine, sessions, sync vs async — the data layer foundation.
+</Card>

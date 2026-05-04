@@ -1,0 +1,407 @@
+---
+title: "27 · Pagination & idempotency"
+description: "Cursor pagination, idempotency keys, retry-safe POST."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** Cursor-paginated lists. POST endpoints are safe to retry without creating duplicates.
+</Tip>
+
+## Concept
+
+Two patterns the API needs as it grows:
+
+<CardGroup cols={2}>
+  <Card title="Cursor pagination" icon="link">
+    Replace offset/limit with stable cursors. Avoids "rows shifted while you paged" bugs.
+  </Card>
+  <Card title="Idempotency keys" icon="shield">
+    Client-supplied unique ID for POSTs. Server de-dupes — retries are safe.
+  </Card>
+</CardGroup>
+
+### Why offset/limit breaks under writes
+
+```
+GET /screenings?offset=0&limit=10  → returns rows 1-10
+[someone inserts a new screening]
+GET /screenings?offset=10&limit=10 → returns rows 10-19, BUT row 10 was already returned!
+```
+
+You either skip rows or return duplicates. Cursor pagination uses a **stable key** (typically `created_at` + `id`) to advance, immune to inserts.
+
+### Why retries need idempotency
+
+```
+Client → POST /screenings   (network drops; retry)
+Client → POST /screenings   (might be duplicate!)
+Server: Two screenings created. User sees one. Other is silent garbage.
+```
+
+With an idempotency key:
+
+```
+Client → POST /screenings  (Idempotency-Key: abc-123)
+        Server creates and stores key→result mapping
+Client → POST /screenings  (Idempotency-Key: abc-123)  ← retry
+        Server finds key, returns the original response. NO new screening.
+```
+
+This is how Stripe, AWS, and every serious payment system avoids duplicate charges.
+
+## Walkthrough
+
+### Step 1 — Cursor pagination
+
+For our `created_at`-ordered lists, the cursor is a base64-encoded `(created_at, id)` tuple.
+
+```python app/common/pagination.py
+"""Cursor pagination utilities."""
+import base64
+import json
+from datetime import datetime
+from typing import Any
+from uuid import UUID
+
+
+def encode_cursor(created_at: datetime, id_: UUID) -> str:
+    payload = {"ts": created_at.isoformat(), "id": str(id_)}
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+
+
+def decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    raw = base64.urlsafe_b64decode(cursor.encode())
+    data = json.loads(raw)
+    return datetime.fromisoformat(data["ts"]), UUID(data["id"])
+```
+
+```python app/repositories/screening_repository.py
+async def list_paginated(
+    db: AsyncSession,
+    *,
+    site_id: str | None = None,
+    status: str | None = None,
+    cursor: tuple[datetime, UUID] | None = None,
+    limit: int = 50,
+) -> tuple[list[Screening], str | None]:
+    """Returns (items, next_cursor). next_cursor=None when no more pages."""
+    stmt = (
+        select(Screening)
+        .order_by(Screening.created_at.desc(), Screening.id.desc())
+        .limit(limit + 1)   # fetch one extra to know if there's a next page
+    )
+    if site_id is not None:
+        stmt = stmt.where(Screening.site_id == site_id)
+    if status is not None:
+        stmt = stmt.where(Screening.status == status)
+    if cursor is not None:
+        cursor_ts, cursor_id = cursor
+        # "After" the cursor in descending order = strictly less than
+        stmt = stmt.where(
+            (Screening.created_at < cursor_ts)
+            | ((Screening.created_at == cursor_ts) & (Screening.id < cursor_id))
+        )
+
+    result = await db.execute(stmt)
+    rows = list(result.scalars().all())
+    if len(rows) > limit:
+        last = rows[limit - 1]
+        from app.common.pagination import encode_cursor
+        next_cursor = encode_cursor(last.created_at, last.id)
+        rows = rows[:limit]
+    else:
+        next_cursor = None
+    return rows, next_cursor
+```
+
+### Step 2 — Pagination dep + route
+
+```python app/dependencies.py
+from app.common.pagination import decode_cursor
+
+
+@dataclass
+class CursorPagination:
+    cursor: tuple[datetime, UUID] | None
+    limit: int
+
+
+def get_cursor_pagination(
+    cursor: str | None = None,
+    limit: int = 50,
+) -> CursorPagination:
+    decoded = decode_cursor(cursor) if cursor else None
+    return CursorPagination(cursor=decoded, limit=min(max(limit, 1), 100))
+```
+
+```python app/routers/screenings.py
+from app.dependencies import CursorPagination, get_cursor_pagination
+
+
+@router.get("", response_model=dict)
+async def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    user: User = Depends(get_current_user),
+    pagination: CursorPagination = Depends(get_cursor_pagination),
+    db: AsyncSession = Depends(get_db_session),
+):
+    # Same RBAC site-isolation rule from Module 17b: coordinators can only see
+    # their own site, sponsors see whatever filter the client passed.
+    if user.role == "coordinator":
+        site_id = user.site_id
+
+    items, next_cursor = await repo.list_paginated(
+        db,
+        site_id=site_id,
+        status=status,
+        cursor=pagination.cursor,
+        limit=pagination.limit,
+    )
+    return {
+        "items": [ScreeningResponse.model_validate(s) for s in items],
+        "next_cursor": next_cursor,
+    }
+```
+
+### Step 3 — Idempotency keys
+
+We already have an `idempotency_key` column on `JobRecord` (Module 13b). Now add it to user-facing POSTs:
+
+```python app/models/idempotency.py
+"""Generic idempotency-key storage. One row per (key, route) pair."""
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+from sqlalchemy import DateTime, Integer, JSON, String, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base
+
+
+class IdempotencyKey(Base):
+    __tablename__ = "idempotency_keys"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    key: Mapped[str] = mapped_column(String(128), nullable=False)
+    route: Mapped[str] = mapped_column(String(200), nullable=False)
+    response_status: Mapped[int] = mapped_column(Integer, nullable=False)
+    response_body: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    # Same (key, route) can only exist once — this is what makes the key idempotent.
+    __table_args__ = (
+        UniqueConstraint("key", "route", name="uq_idempotency_key_route"),
+    )
+```
+
+Migration: `uv run alembic revision --autogenerate -m "add idempotency_keys"` then `uv run alembic upgrade head`.
+
+### Step 4 — A reusable dep + decorator
+
+```python app/dependencies.py
+from fastapi import Header
+from typing import Annotated
+
+
+def get_idempotency_key(
+    idempotency_key: Annotated[str | None, Header()] = None,
+) -> str | None:
+    return idempotency_key
+```
+
+```python app/common/idempotency.py
+"""Idempotent route helpers."""
+import json
+from collections.abc import Awaitable, Callable
+
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.idempotency import IdempotencyKey
+
+
+async def get_or_store(
+    db: AsyncSession,
+    *,
+    key: str,
+    route: str,
+    perform: Callable[[], Awaitable[tuple[int, dict]]],   # async function that returns (status_code, body_dict)
+):
+    """If `(key, route)` exists, return its stored response. Otherwise execute and store."""
+    existing = await db.execute(
+        select(IdempotencyKey).where(
+            IdempotencyKey.key == key,
+            IdempotencyKey.route == route,
+        )
+    )
+    cached = existing.scalars().first()
+    if cached is not None:
+        return JSONResponse(status_code=cached.response_status, content=cached.response_body)
+
+    status, body = await perform()
+
+    db.add(IdempotencyKey(
+        key=key,
+        route=route,
+        response_status=status,
+        response_body=body,
+    ))
+    await db.flush()
+
+    return JSONResponse(status_code=status, content=body)
+```
+
+### Step 5 — Use it in the create route
+
+```python app/routers/screenings.py
+# Add the imports the snippet relies on.
+from fastapi.responses import JSONResponse
+from app.common import idempotency
+from app.dependencies import get_idempotency_key
+
+
+@router.post("", status_code=201)
+async def create_screening(
+    payload: ScreeningCreate,
+    user: User = Depends(get_current_user),
+    uow: UnitOfWork = Depends(get_uow),
+    runner = Depends(get_task_runner),
+    progress = Depends(get_progress_manager),
+    idem_key: str | None = Depends(get_idempotency_key),
+    db: AsyncSession = Depends(get_db_session),
+):
+    async def _perform():
+        screening = await service.submit_screening(
+            uow, runner, progress, user=user, payload=payload,
+        )
+        return 201, {
+            "id": str(screening.id),
+            "status": screening.status,
+            "site_id": screening.site_id,
+            # ... rest of response
+        }
+
+    if idem_key:
+        return await idempotency.get_or_store(
+            db, key=idem_key, route="POST /screenings", perform=_perform,
+        )
+
+    status, body = await _perform()
+    return JSONResponse(status_code=status, content=body)
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why `(created_at, id)` for the cursor and not just `created_at`?">
+    Two screenings can have the same `created_at` (microseconds collision). Adding `id` as tiebreaker gives a totally-ordered cursor.
+  </Accordion>
+  <Accordion title="Base64 encoding the cursor — why?">
+    To make it opaque. Clients should treat cursors as black boxes. If you exposed `?after_id=42`, clients would build URLs by hand and depend on the format. Base64 says "use what we gave you".
+  </Accordion>
+  <Accordion title="`limit + 1` trick">
+    Simple way to know "is there a next page?". Fetch N+1 rows; if you got more than N, return N items and use row N's key as next_cursor.
+  </Accordion>
+  <Accordion title="What's a reasonable idempotency-key TTL?">
+    24 hours is common. After that, the same key could theoretically be a *new* operation. Some systems make it shorter (1 hour) for high-volume endpoints. Add a cleanup job that deletes old idempotency rows.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Cursor-paginate">
+    Submit ~5 screenings. Then:
+    ```bash
+    curl -H "Authorization: Bearer $ALICE" \
+      'http://localhost:8000/api/v1/screenings?limit=2'
+    # Returns 2 items + next_cursor
+    NEXT=$(... | jq -r .next_cursor)
+
+    curl -H "Authorization: Bearer $ALICE" \
+      "http://localhost:8000/api/v1/screenings?limit=2&cursor=$NEXT"
+    # Returns next 2
+    ```
+  </Step>
+  <Step title="Test idempotency">
+    ```bash
+    KEY=$(uuidgen)
+    BODY='{"site_id":"SITE-001","candidate_initials":"II","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["m"],"is_pregnant":false,"has_liver_disease":false,"in_other_trial":false}'
+
+    # First request — creates
+    curl -H "Authorization: Bearer $ALICE" -H "Idempotency-Key: $KEY" \
+      -H "Content-Type: application/json" -d "$BODY" \
+      http://localhost:8000/api/v1/screenings | jq .id
+
+    # Second request — same response, no new screening
+    curl -H "Authorization: Bearer $ALICE" -H "Idempotency-Key: $KEY" \
+      -H "Content-Type: application/json" -d "$BODY" \
+      http://localhost:8000/api/v1/screenings | jq .id
+
+    # Both responses have the same ID
+    ```
+  </Step>
+  <Step title="Verify only one row in DB">
+    ```bash
+    sqlite3 enrollment.db "SELECT COUNT(*) FROM screenings WHERE candidate_initials='II'"
+    # 1
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What if the body is different on retry but the key is the same?">
+    **Reject with 422** — same key + different body is a client bug. Stripe does this; we should too. Hash the body as part of the stored record; on second hit, compare hashes.
+  </Accordion>
+  <Accordion title="Cursor pagination drawbacks?">
+    Can't jump to "page 47" — only forward/backward by cursor. Acceptable for "infinite scroll" UIs; not for "page numbers" UIs. Pick the right tool for the UI you have.
+  </Accordion>
+  <Accordion title="What about backward pagination?">
+    Same idea, reverse the comparison. Or store both `next_cursor` and `prev_cursor` in the response.
+  </Accordion>
+  <Accordion title="Should idempotency be on every POST?">
+    Mutation operations that *create or modify*: yes. Read-only operations: no point. The cost is one extra DB lookup; the benefit is huge for retries.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add idempotency to the **`POST /screenings/{id}/enroll`** endpoint.
+
+    Why: a coordinator clicks "enroll" twice (slow network). Without idempotency, you'd issue two `subject_id`s and ignore the second (because of `AlreadyEnrolled`). With idempotency, the second click returns the same response as the first — no error, no second `subject_id`.
+
+    Use the same `idempotency.get_or_store` helper.
+  </Tab>
+  <Tab title="Hint">
+    Wrap the existing `service.enroll_screening(...)` call in a `_perform` async function that returns `(200, response_body)` on success, then route through `get_or_store`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/27-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Idempotency is what makes "the user clicked twice" stop being a billing bug.** Once the pattern is in place, every other concern simplifies: retries are safe, network blips don't double-charge, double-clicks are no-ops. Stripe's reliability comes more from idempotency keys than from any other single feature.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub has basic offset/limit pagination only — both proper cursor pagination and user-facing idempotency keys are real production gaps.
+
+## Next module
+
+<Card title="Module 28: Task queues at scale" icon="rocket" href="/modules/28-task-queues">
+  When `BackgroundTasks` is too small. Celery/Arq, retries, DLQ, the outbox pattern.
+</Card>

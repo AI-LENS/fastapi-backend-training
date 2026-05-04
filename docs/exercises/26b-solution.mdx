@@ -1,0 +1,61 @@
+---
+title: "26b · Solution"
+description: "Schemathesis CI job."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```yaml .github/workflows/ci.yml
+  contract:
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: enrollment
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: enrollment
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U enrollment" --health-interval 10s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - run: uv add --group dev schemathesis
+      - name: Start API in background
+        run: |
+          ENROLLMENT_DB_URL=postgresql+asyncpg://enrollment:ci@localhost:5432/enrollment \
+          ENROLLMENT_SECRET_KEY=ci-test-secret-32-bytes-long-aaaa \
+          uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          for i in {1..30}; do
+            if curl -sf http://localhost:8000/health/live; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Schemathesis
+        run: uv run schemathesis run --checks all http://localhost:8000/openapi.json
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why `--checks all`?">
+    Schemathesis runs many built-in checks (status code matches spec, response schema valid, no server errors, etc.). `all` enables them.
+  </Accordion>
+  <Accordion title="Should this job authenticate?">
+    Yes for full coverage:
+    ```bash
+    schemathesis run --header "Authorization: Bearer $TOKEN" ...
+    ```
+    Where `$TOKEN` is obtained via a CI login call before running.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 26c: Monitoring & alerting" icon="chart-bar" href="/modules/26c-monitoring-alerting" />

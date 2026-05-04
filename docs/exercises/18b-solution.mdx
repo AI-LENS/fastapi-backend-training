@@ -1,0 +1,72 @@
+---
+title: "18b · Solution"
+description: "Audit-log view permission."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/services/permission_service.py
+async def ensure_can_view_audit_log(db: AsyncSession, user: User) -> None:
+    if user.role == "sponsor":
+        return
+    await audit.append(
+        db,
+        actor_id=str(user.id),
+        actor_role=user.role,
+        action="audit.view_denied",
+        resource_type="audit_log",
+        resource_id="all",
+        metadata={"user_site": user.site_id},
+    )
+    raise Forbidden("Only sponsors can view the audit log")
+```
+
+```python app/routers/admin.py
+@router.get("/audit")
+async def list_audit(
+    actor_id: str | None = None,
+    resource_type: str | None = None,
+    resource_id: str | None = None,
+    action: str | None = None,
+    limit: int = 100,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    await permission_service.ensure_can_view_audit_log(db, user)
+    rows = await audit.list_filtered(
+        db, actor_id=actor_id, resource_type=resource_type,
+        resource_id=resource_id, action=action, limit=limit,
+    )
+    await db.commit()  # commit any deny audits written above
+    return rows
+```
+
+## Verify
+
+```bash
+curl -i -H "Authorization: Bearer $ALICE" http://localhost:8000/api/v1/admin/audit
+# 403 (after RBAC check)
+
+# If you bypass RBAC by mounting differently:
+curl -i -H "Authorization: Bearer $ALICE" http://localhost:8000/api/v1/admin/audit
+# 403 — caught by permission_service even without RBAC
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Defense in depth: RBAC + permission service">
+    The admin router already requires `sponsor` via `require_role`. The permission service repeats the check. Why? **Different access paths.** A future CLI tool that calls `audit.list_filtered` directly bypasses RBAC but still goes through the permission service. Layered defenses survive accidental holes.
+  </Accordion>
+  <Accordion title="Why commit the deny audits?">
+    The `Forbidden` exception bubbles up before the route can finish. Without an explicit commit, the audit row is rolled back when the exception handler runs. We commit *before* raising to ensure the deny is recorded.
+
+    Better pattern: have the audit write be in its own short-lived session inside the permission service. Trade-off: harder to keep transactionally consistent with the business write on the success path.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 19: Rate limit & cache" icon="server" href="/modules/19-rate-limit-cache" />

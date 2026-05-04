@@ -1,0 +1,319 @@
+---
+title: "17 · RBAC"
+description: "Role-based access control. Coordinator vs sponsor. Route-level guards."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~10 lines · **Outcome:** Routes guarded by role. Coordinators can submit screenings; only sponsors can access admin endpoints.
+</Tip>
+
+## Concept
+
+Module 16 made `get_current_user` a thing — every request is now identified. **Authorization** is the next layer: "yes, this user is logged in, but are they *allowed* to do this?"
+
+### Two flavors of authorization
+
+<CardGroup cols={2}>
+  <Card title="Role-based (RBAC)" icon="key">
+    "Sponsors can list all sites." Decision based on the user's *role*. **This module.**
+  </Card>
+  <Card title="Object-level" icon="shield">
+    "Coordinator A can see screenings only at Site A." Decision based on the user *and* the specific resource. **Module 17b.**
+  </Card>
+</CardGroup>
+
+You need **both**. RBAC alone leaves you wide open to "I'll just change the ID in the URL" attacks (OWASP API #1). 17b fixes that.
+
+### Our roles
+
+| Role | Can do |
+|---|---|
+| `coordinator` | Submit screenings at their site, see their site's screenings, enroll subjects |
+| `sponsor` | Everything coordinators can do, plus see all sites and the admin DLQ |
+
+### The pattern: dependency factory
+
+```python
+admin_only = Depends(require_role("sponsor"))
+
+@router.get("/admin/jobs", dependencies=[admin_only])
+async def list_jobs(...): ...
+```
+
+`require_role` is a **factory** — it returns a dependency function. This is so you can parameterize the role per endpoint.
+
+## Walkthrough
+
+### Step 1 — Add `Forbidden` to the exception hierarchy
+
+`Forbidden` is a domain error, so it lives next to the other domain exceptions from Module 11. (Putting it in `dependencies.py` works, but later modules — 17b, 18b — import it from `app.exceptions`, so we anchor it here once.)
+
+```python app/exceptions.py
+# Append to the file you wrote in Module 11.
+
+class Forbidden(DomainError):
+    code = "forbidden"
+    status_code = 403
+```
+
+### Step 2 — `require_role` dependency factory
+
+```python app/dependencies.py
+# Append to the file you wrote in Module 10. `Depends` and `get_current_user`
+# (from Module 16) are already imported at the top.
+from app.exceptions import Forbidden
+from app.models.user import User
+
+
+def require_role(*allowed_roles: str):
+    """Return a dependency that allows only the given roles.
+
+    `sponsor` always has all permissions (admin override).
+    """
+
+    async def _check(user: User = Depends(get_current_user)) -> User:
+        if user.role == "sponsor":
+            return user  # sponsors can do anything
+        if user.role not in allowed_roles:
+            raise Forbidden(
+                f"Role {user.role!r} not allowed; required: {allowed_roles}",
+                details={"required_roles": list(allowed_roles)},
+            )
+        return user
+
+    return _check
+```
+
+### Step 3 — Apply to the admin router
+
+<Note>
+  `app/routers/admin.py` was introduced as the **Module 13b DLQ exercise**. If you skipped it, create the file now with a single empty router so the snippet below has something to import:
+
+  ```python app/routers/admin.py
+  from fastapi import APIRouter
+  router = APIRouter(prefix="/admin", tags=["admin"])
+  ```
+</Note>
+
+```python app/routers/admin.py
+from fastapi import APIRouter, Depends
+
+from app.dependencies import require_role
+
+router = APIRouter(
+    prefix="/admin",
+    tags=["admin"],
+    dependencies=[Depends(require_role("sponsor"))],   # ← every endpoint requires sponsor
+)
+```
+
+Every route in `/admin` now requires a sponsor. Coordinators get 403.
+
+### Step 4 — Apply to specific routes
+
+For routes inside a non-restricted router, attach to the specific route:
+
+```python app/routers/screenings.py
+@router.post(
+    "/{screening_id}/enroll",
+    response_model=ScreeningResponse,
+    dependencies=[Depends(require_role("coordinator"))],   # only coordinators enroll
+)
+async def enroll(...): ...
+```
+
+### Step 5 — Default everything to authenticated
+
+<Note>
+  We don't yet have an `app/routers/health.py` file — until now `/health` has been an inline `@app.get` route in `main.py`. Either keep the inline route (and skip the `health.router` line below), or extract it into `app/routers/health.py`:
+
+  ```python app/routers/health.py
+  from fastapi import APIRouter
+  router = APIRouter(prefix="", tags=["health"])
+
+  @router.get("/health")
+  def health(): return {"status": "ok"}
+  ```
+</Note>
+
+In `main.py`, apply `get_current_user` as a router-level dep so anonymous calls fail by default:
+
+```python app/main.py
+# Add the imports needed for the wiring below.
+from app.dependencies import get_current_user
+from app.routers import admin, auth, health, screenings, sites
+
+
+def create_app():
+    app = FastAPI(...)
+
+    auth_required = Depends(get_current_user)
+
+    # Health & auth routes — no auth required
+    app.include_router(health.router, prefix=settings.api_prefix)
+    app.include_router(auth.router, prefix=settings.api_prefix)
+
+    # Everything else requires auth
+    app.include_router(sites.router, prefix=settings.api_prefix, dependencies=[auth_required])
+    app.include_router(screenings.router, prefix=settings.api_prefix, dependencies=[auth_required])
+    app.include_router(admin.router, prefix=settings.api_prefix, dependencies=[auth_required])
+```
+
+`auth_required` runs before every route in those routers. No anonymous access by default.
+
+### Step 6 — Seed a coordinator alongside admin
+
+```python app/main.py
+# Imports needed (add to your existing main.py):
+# from app.db import async_session
+# from app.repositories import user_repository as user_repo
+# from app.services.auth_service import hash_password
+# from app.models.user import User
+
+async def _seed_users():
+    async with async_session() as db:
+        existing = await user_repo.list_all(db)
+        if not existing:
+            db.add_all([
+                User(
+                    email="admin@example.com",
+                    hashed_password=hash_password("admin"),
+                    full_name="Default Sponsor",
+                    role="sponsor",
+                ),
+                User(
+                    email="alice@example.com",
+                    hashed_password=hash_password("alice"),
+                    full_name="Alice (Coordinator @ SITE-001)",
+                    role="coordinator",
+                    site_id="SITE-001",
+                ),
+                User(
+                    email="bob@example.com",
+                    hashed_password=hash_password("bob"),
+                    full_name="Bob (Coordinator @ SITE-002)",
+                    role="coordinator",
+                    site_id="SITE-002",
+                ),
+            ])
+            await db.commit()
+            logger.info("Seeded users: admin, alice, bob")
+```
+
+In your lifespan, replace the existing `await _seed_admin()` call with `await _seed_users()`.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why is `sponsor` an admin override?">
+    Convention. In a real app you'd probably have explicit `admin` and `sponsor` as separate roles, but for our domain `sponsor` covers both. Make this explicit per project.
+  </Accordion>
+  <Accordion title="`dependencies=[Depends(require_role(...))]` vs putting it on a route param">
+    Both work. `dependencies=[...]` attaches the check without exposing it as a route parameter. Use this when the dependency's *return value* isn't needed — just its side effect (raise on fail).
+  </Accordion>
+  <Accordion title="What about nested role hierarchies?">
+    Get fancy with `is_admin > is_sponsor > is_coordinator`. We keep it flat — overengineering hurts.
+  </Accordion>
+  <Accordion title="`*allowed_roles` (varargs)">
+    Lets you write `require_role('coordinator', 'sponsor')` for endpoints that allow multiple roles. Cleaner than `require_roles_in(['coordinator', 'sponsor'])`.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Login as Alice (coordinator)">
+    ```bash
+    ALICE=$(curl -sX POST http://localhost:8000/api/v1/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email":"alice@example.com","password":"alice"}' | jq -r .access_token)
+    ```
+  </Step>
+  <Step title="Try to access admin endpoint as Alice">
+    ```bash
+    curl -i -H "Authorization: Bearer $ALICE" http://localhost:8000/api/v1/admin/jobs
+    # 403 forbidden — Alice is a coordinator, not a sponsor
+    ```
+  </Step>
+  <Step title="Login as admin (sponsor)">
+    ```bash
+    ADMIN=$(curl -sX POST http://localhost:8000/api/v1/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email":"admin@example.com","password":"admin"}' | jq -r .access_token)
+    curl -i -H "Authorization: Bearer $ADMIN" http://localhost:8000/api/v1/admin/jobs
+    # 200 OK
+    ```
+  </Step>
+  <Step title="Anonymous access">
+    ```bash
+    curl -i http://localhost:8000/api/v1/screenings
+    # 401 unauthorized — no token
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I check role inside service functions or only at the route?">
+    Generally at the route, via deps. But: if your service is **multi-step and might be called from non-HTTP contexts** (CLI, worker), put the role check inside too. Defense in depth.
+  </Accordion>
+  <Accordion title="What about a permission-string approach (`'screenings.read'`, `'screenings.enroll'`)?">
+    That's permission-based access control (PBAC), more granular than role-based. Common in SaaS apps with custom permissions per customer. Roles compose permissions ("admin role has all permissions"). For our app, roles are sufficient.
+  </Accordion>
+  <Accordion title="The `Forbidden` exception's status code is 403 — when do I use 401 vs 403?">
+    **401**: "I don't know who you are" (no token, expired token). **403**: "I know who you are, but you can't do this" (insufficient role). Different problems, different responses.
+  </Accordion>
+  <Accordion title="What if I want different roles for different HTTP methods on the same path?">
+    Either split the routes (separate `@router.get` and `@router.post`) or check dynamically inside the handler. The split is cleaner.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Decorate the screening routes with appropriate role guards:
+
+    - `POST /screenings` → coordinators only (sponsors don't submit screenings — they oversee)
+    - `GET /screenings` → both roles
+    - `POST /screenings/{id}/enroll` → coordinators only
+    - `DELETE /screenings/{id}` → coordinators only
+
+    Then login as the sponsor and try to POST a screening — verify you get 403.
+
+    **Trick part:** with the current `require_role("sponsor")` always-allows logic, the sponsor will pass. Modify `require_role` to support a `strict=True` mode that **doesn't** auto-allow sponsors. Use it for `POST /screenings` to enforce "this is coordinator-only, period."
+  </Tab>
+  <Tab title="Hint">
+    ```python
+    def require_role(*allowed_roles: str, strict: bool = False):
+        async def _check(user: User = Depends(get_current_user)) -> User:
+            if not strict and user.role == "sponsor":
+                return user
+            if user.role not in allowed_roles:
+                raise Forbidden(...)
+            return user
+        return _check
+    ```
+    Then: `dependencies=[Depends(require_role("coordinator", strict=True))]`
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/17-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Defaulting to "auth required" at the router level is the safest pattern.** Adding `dependencies=[Depends(get_current_user)]` to every router catches the dangerous mistake "I forgot to protect this endpoint". Forgetting to *open up* a public endpoint is a much smaller bug than forgetting to *protect* a private one.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/dependencies.py:55-61` — the production `require_role` factory.
+
+## Next module
+
+<Card title="Module 17b: Object-level authorization" icon="shield" href="/modules/17b-object-level-auth">
+  RBAC isn't enough. Now block the OWASP API #1 attack: changing IDs in the URL.
+</Card>

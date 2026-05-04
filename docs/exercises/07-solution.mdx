@@ -1,0 +1,74 @@
+---
+title: "07 · Solution"
+description: "Add `enrolled_at` to Screening via Alembic migration."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Steps
+
+1. Add to `app/models/screening.py`:
+
+```python
+from datetime import datetime
+from sqlalchemy import DateTime
+
+# inside class Screening:
+enrolled_at: Mapped[datetime | None] = mapped_column(
+    DateTime(timezone=True), nullable=True
+)
+```
+
+2. Generate the migration:
+
+```bash
+uv run alembic revision --autogenerate -m "add enrolled_at to screenings"
+```
+
+3. The generated `upgrade()` will look like:
+
+```python
+def upgrade() -> None:
+    op.add_column(
+        "screenings",
+        sa.Column("enrolled_at", sa.DateTime(timezone=True), nullable=True),
+    )
+
+def downgrade() -> None:
+    op.drop_column("screenings", "enrolled_at")
+```
+
+4. Apply:
+
+```bash
+uv run alembic upgrade head
+```
+
+5. Verify:
+
+```bash
+sqlite3 enrollment.db ".schema screenings" | grep enrolled_at
+```
+
+6. Roll back to test:
+
+```bash
+uv run alembic downgrade -1
+sqlite3 enrollment.db ".schema screenings" | grep enrolled_at  # gone
+uv run alembic upgrade head  # back
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why nullable=True?">
+    Existing rows have no `enrolled_at` value. Making the column NOT NULL would either fail the migration or require a default-value backfill. Nullable is the safe choice; only enrolled rows have it set.
+  </Accordion>
+  <Accordion title="Should `enrolled_at` be `Mapped[datetime] = ...` (non-Optional) with a server default?">
+    No — most rows are pre-enrollment, so they shouldn't have an artificial timestamp. Reserve the column for what it means: "the moment we enrolled this subject". Module 09 sets it during enrollment.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 08: Repository pattern" icon="folder" href="/modules/08-repository-pattern" />

@@ -1,0 +1,108 @@
+---
+title: "26c · Solution"
+description: "Stuck-in-reviewing alert."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/core/metrics.py
+oldest_reviewing_age_seconds = Gauge(
+    "enrollment_oldest_reviewing_age_seconds",
+    "Age in seconds of the oldest screening still in 'reviewing' status",
+)
+```
+
+```python app/main.py
+import asyncio
+from datetime import datetime, timezone
+
+from sqlalchemy import select, func
+
+from app.core.metrics import oldest_reviewing_age_seconds
+from app.models.screening import Screening
+
+
+async def _periodic_metrics_updater():
+    while True:
+        try:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(func.min(Screening.created_at)).where(Screening.status == "reviewing")
+                )
+                oldest = result.scalar()
+                if oldest is not None:
+                    age = (datetime.now(timezone.utc) - oldest).total_seconds()
+                    oldest_reviewing_age_seconds.set(age)
+                else:
+                    oldest_reviewing_age_seconds.set(0)
+        except Exception:
+            logger.exception("metrics updater failed")
+        await asyncio.sleep(60)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... existing setup ...
+    metrics_task = asyncio.create_task(_periodic_metrics_updater())
+    yield
+    metrics_task.cancel()
+    # ... rest
+```
+
+```yaml ops/alerts.yml
+- alert: ScreeningStuckInReviewing
+  expr: enrollment_oldest_reviewing_age_seconds > 1800
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Screening stuck in reviewing > 30 min"
+    description: "Oldest screening in 'reviewing' is {{ $value }} seconds old."
+    runbook: "https://internal.example.com/runbooks/stuck-reviewing"
+```
+
+```markdown ops/runbooks/stuck-reviewing.md
+# Runbook: Screening stuck in reviewing
+
+**Alert:** `ScreeningStuckInReviewing`
+**Severity:** warning
+
+## Diagnosis
+
+1. Find the stuck screening:
+   ```sql
+   SELECT id, site_id, age, created_at FROM screenings
+   WHERE status = 'reviewing'
+   ORDER BY created_at ASC LIMIT 5;
+   ```
+
+2. Check matching `job_records`:
+   ```sql
+   SELECT * FROM job_records WHERE target_id IN (...) ORDER BY updated_at DESC;
+   ```
+
+3. Common causes:
+   - **Worker process killed mid-job** → `job_records.status = 'running'` but `updated_at` is old. Reset to `queued`.
+   - **Pipeline raised** → check `last_error`. May be in DLQ if attempts exhausted.
+   - **API restart** → `_app_ready` was reset; check startup-time sweep ran.
+
+## Fix
+
+```sql
+-- Re-queue stuck running jobs older than 1 hour
+UPDATE job_records SET status='queued', attempts=0
+WHERE status='running' AND updated_at < now() - interval '1 hour';
+```
+
+Then poll the screening — should re-process.
+```
+
+## Verify
+
+Manually leave a screening in `reviewing` (kill the worker mid-flight in dev). After 30 min, the alert fires (or sooner with a lower threshold for testing).
+
+## Next
+
+<Card title="Module 27: Pagination & idempotency" icon="link" href="/modules/27-pagination-idempotency" />

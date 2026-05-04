@@ -1,0 +1,84 @@
+---
+title: "17 · Solution"
+description: "Strict role guards for screening routes."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/dependencies.py
+def require_role(*allowed_roles: str, strict: bool = False):
+    """Return a dep that requires at least one of the given roles.
+
+    By default sponsors are auto-allowed. Pass `strict=True` to disable that override
+    when an action is for a specific role only (not the sponsor "see-all" view).
+    """
+
+    async def _check(user: User = Depends(get_current_user)) -> User:
+        if not strict and user.role == "sponsor":
+            return user
+        if user.role not in allowed_roles:
+            raise Forbidden(
+                f"Role {user.role!r} not allowed; required: {allowed_roles}",
+                details={"required_roles": list(allowed_roles)},
+            )
+        return user
+
+    return _check
+```
+
+## Routes
+
+```python app/routers/screenings.py
+@router.post(
+    "",
+    response_model=ScreeningResponse,
+    status_code=201,
+    dependencies=[Depends(require_role("coordinator", strict=True))],   # ← strict
+)
+async def create_screening(...): ...
+
+
+@router.get("", response_model=list[ScreeningResponse])
+async def list_screenings(...): ...
+# No extra guard — both roles can list (object-level filtering in Module 17b)
+
+
+@router.post(
+    "/{screening_id}/enroll",
+    response_model=ScreeningResponse,
+    dependencies=[Depends(require_role("coordinator", strict=True))],
+)
+async def enroll(...): ...
+
+
+@router.delete(
+    "/{screening_id}",
+    status_code=204,
+    dependencies=[Depends(require_role("coordinator", strict=True))],
+)
+async def delete_screening(...): ...
+```
+
+## Verify
+
+```bash
+ADMIN=$(curl -sX POST .../auth/login -d '{"email":"admin@example.com","password":"admin"}' | jq -r .access_token)
+curl -i -H "Authorization: Bearer $ADMIN" -X POST http://localhost:8000/api/v1/screenings \
+  -H "Content-Type: application/json" \
+  -d '{...}'
+# 403 — sponsor cannot submit, even though it usually has admin override
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why split 'sponsor sees all' from 'sponsor can do all'?">
+    Sponsor *should* see all screenings (oversight). Sponsor *should not* submit screenings on behalf of sites (audit trail / responsibility). Strict mode encodes this distinction.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 17b: Object-level authorization" icon="shield" href="/modules/17b-object-level-auth" />

@@ -1,0 +1,41 @@
+---
+title: "Glossary"
+description: "Backend and clinical terms used throughout the training."
+---
+
+## Backend terms
+
+| Term | Meaning |
+|---|---|
+| **ASGI** | Asynchronous Server Gateway Interface. Modern Python web standard, replaces WSGI. FastAPI is an ASGI app; Uvicorn is an ASGI server. |
+| **Dependency injection (DI)** | Asking the framework to provide things you need (DB session, current user) rather than creating them yourself. FastAPI's `Depends()`. |
+| **DTO / schema** | Data Transfer Object. In FastAPI, a Pydantic model used for requests and responses. |
+| **ORM** | Object-Relational Mapper. SQLAlchemy converts table rows ↔ Python objects. |
+| **Repository** | A typed API over the ORM that exposes domain operations (`get_by_id`, `list_by_site`) instead of raw SQL. |
+| **Service** | The layer that holds business decisions and orchestrates repos. |
+| **Pipeline** | A series of independent processing stages chained by an orchestrator. |
+| **Worker** | A process or thread that executes background work outside the request/response cycle. |
+| **Idempotency key** | A client-supplied unique key that makes repeated submissions of the same operation safe (de-duped server-side). |
+| **JWT** | JSON Web Token. A signed token format used for stateless authentication. |
+| **RBAC** | Role-Based Access Control. Authorization based on a user's role(s). |
+| **SSE** | Server-Sent Events. One-way HTTP streaming for server → client updates. |
+| **Cursor pagination** | Pagination via opaque tokens (cursors) instead of `offset`/`limit`. Stable under writes. |
+| **Cooperative cancellation** | A long-running task periodically checks "should I stop?" instead of being killed. |
+| **Lifespan** | FastAPI's startup/shutdown context manager. Replaces deprecated `@app.on_event`. |
+| **Middleware** | Code that runs before/after every request. CORS, logging, request IDs. |
+
+## Clinical / domain terms
+
+| Term | Meaning |
+|---|---|
+| **CRF** | Case Report Form. The structured form clinical-trial site staff fill in for each subject visit. |
+| **Site** | A hospital or clinic running the trial. |
+| **Coordinator** | Site staff member who enters subject data. |
+| **Sponsor** | The pharma/organization running the trial. |
+| **Screening** | Process of checking if a candidate qualifies for the trial. |
+| **Subject** | A person enrolled in the trial. Gets a unique ID like `S-001`. |
+| **Inclusion criteria** | Conditions you MUST meet to join. |
+| **Exclusion criteria** | Conditions that DISQUALIFY you. |
+| **SDTM** | Study Data Tabulation Model — CDISC standard for clinical trial submission data. (Not used in *this* training; it's how the AnnotateHub project ties into the FDA / EMA submission process.) |
+| **EDC** | Electronic Data Capture system. The product category our training app belongs to in real life. |
+| **PII** | Personally Identifiable Information. Trial systems strictly avoid storing it; they use initials and subject IDs. |

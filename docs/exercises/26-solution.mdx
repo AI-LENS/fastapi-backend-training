@@ -1,0 +1,67 @@
+---
+title: "26 · Solution"
+description: "Back-pressure via readiness probe."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/workers/task_runner.py
+class BackgroundTaskRunner:
+    # ...
+    def active_count(self) -> int:
+        return sum(1 for t in self._tasks.values() if not t.done())
+```
+
+```python app/routers/health.py
+from fastapi import Depends
+from app.dependencies import get_task_runner
+
+
+@router.get("/health/ready", include_in_schema=False)
+async def readiness(
+    db: AsyncSession = Depends(get_db_session),
+    runner = Depends(get_task_runner),
+):
+    if not _app_ready:
+        raise HTTPException(503, detail={"status": "starting"})
+    try:
+        await db.execute(text("SELECT 1"))
+    except SQLAlchemyError:
+        raise HTTPException(503, detail={"status": "db_unreachable"})
+    if runner.active_count() > 100:
+        raise HTTPException(503, detail={"status": "saturated", "active_jobs": runner.active_count()})
+    return {"status": "ready", "active_jobs": runner.active_count()}
+```
+
+## Verify
+
+Submit 200 screenings rapidly:
+
+```bash
+for i in {1..200}; do
+  curl -sX POST http://localhost:8000/api/v1/screenings \
+    -H "Authorization: Bearer $ALICE" -H "Content-Type: application/json" \
+    -d '...' > /dev/null &
+done
+
+# Quickly hit readiness
+curl -i http://localhost:8000/health/ready
+# 503 saturated, with active_jobs > 100
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why 100? It depends on your hardware.">
+    For our `max_workers=4` thread pool plus async overhead, 100 in-flight is plenty. Production: instrument it, watch the histogram, set the threshold at p95 of your normal load.
+  </Accordion>
+  <Accordion title="Won't this cause the LB to take this instance out, dropping the queue?">
+    The instance keeps processing existing work. New traffic routes to other instances. Queue drains. Once below threshold, instance returns to ready. **Self-healing back-pressure.**
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 26b: CI/CD" icon="rocket" href="/modules/26b-cicd" />

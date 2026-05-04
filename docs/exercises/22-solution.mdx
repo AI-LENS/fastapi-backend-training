@@ -1,0 +1,65 @@
+---
+title: "22 · Solution"
+description: "Boundary tests for pipeline stages."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python tests/unit/test_pipeline_stages.py
+@pytest.mark.parametrize("age,expected", [
+    (-1, False),
+    (0, False),
+    (17, False),
+    (18, True),
+    (75, True),
+    (76, False),
+    (120, False),
+    (121, False),
+])
+def test_check_age_boundaries(age, expected):
+    assert check_age(_s(age=age)).passed is expected
+
+
+@pytest.mark.parametrize("count,expected", [
+    (0, False),
+    (1, True),
+    (5, True),
+    (100, True),
+])
+def test_check_medications_count(count, expected):
+    meds = [f"med{i}" for i in range(count)]
+    assert check_medications(_s(medications=meds)).passed is expected
+
+
+def test_minimum_eligible_screening():
+    """Borderline-eligible: age=18, exactly 1 med."""
+    s = _s(age=18, medications=["minimum-required-med"])
+    for stage in [check_age, check_diagnosis, check_medications,
+                  check_pregnancy, check_liver_disease, check_other_trial]:
+        result = stage(s)
+        assert result.passed, f"Stage {stage.__name__} failed: {result.reason}"
+```
+
+## Verify
+
+```bash
+uv run pytest tests/unit/test_pipeline_stages.py -v
+# All pass
+
+uv run pytest tests/unit/test_pipeline_stages.py --cov=app/pipelines/eligibility/stages --cov-report=term-missing
+# Should show 100%
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why test obviously-broken inputs like age=-1?">
+    Pydantic catches them at the API boundary. But the stage itself doesn't know about Pydantic — it could be called from a CLI, a test, a worker. Testing the stage's contract directly defends against future regressions.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 22b: Contract, load & security tests" icon="shield" href="/modules/22b-contract-load-security-tests" />

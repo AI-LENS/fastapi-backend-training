@@ -1,0 +1,156 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "FastAPI Backend Training",
+  "logo": {
+    "dark": "/logo/dark.svg",
+    "light": "/logo/light.svg"
+  },
+  "favicon": "/favicon.svg",
+  "colors": {
+    "primary": "#0EA5E9",
+    "light": "#38BDF8",
+    "dark": "#0284C7"
+  },
+  "navigation": [
+    {
+      "group": "Welcome",
+      "pages": [
+        "introduction",
+        "quickstart",
+        "problem-statement",
+        "learning-path"
+      ]
+    },
+    {
+      "group": "Part A — Foundations",
+      "pages": [
+        "modules/01-hello-fastapi",
+        "modules/02-pydantic-schemas",
+        "modules/03-routers",
+        "modules/04-project-structure"
+      ]
+    },
+    {
+      "group": "Part B — Data layer",
+      "pages": [
+        "modules/05-sqlalchemy",
+        "modules/06-models",
+        "modules/07-migrations",
+        "modules/08-repository-pattern"
+      ]
+    },
+    {
+      "group": "Part C — Business logic",
+      "pages": [
+        "modules/09-service-layer",
+        "modules/10-dependency-injection",
+        "modules/10b-unit-of-work",
+        "modules/11-exceptions"
+      ]
+    },
+    {
+      "group": "Part D — Async & background",
+      "pages": [
+        "modules/12-async-await",
+        "modules/13-workers",
+        "modules/13b-worker-semantics",
+        "modules/14-pipelines",
+        "modules/15-realtime-sse"
+      ]
+    },
+    {
+      "group": "Part E — Security & cross-cutting",
+      "pages": [
+        "modules/16-jwt-auth",
+        "modules/17-rbac",
+        "modules/17b-object-level-auth",
+        "modules/17c-audit-logs",
+        "modules/18-middleware",
+        "modules/18b-permission-service",
+        "modules/19-rate-limit-cache"
+      ]
+    },
+    {
+      "group": "Part F — Observability",
+      "pages": [
+        "modules/20-logging",
+        "modules/21-metrics-tracing"
+      ]
+    },
+    {
+      "group": "Part G — Testing",
+      "pages": [
+        "modules/22-unit-tests",
+        "modules/22b-contract-load-security-tests",
+        "modules/23-integration-tests"
+      ]
+    },
+    {
+      "group": "Part H — Production",
+      "pages": [
+        "modules/24-config-secrets",
+        "modules/25-docker",
+        "modules/26-deployment",
+        "modules/26b-cicd",
+        "modules/26c-monitoring-alerting"
+      ]
+    },
+    {
+      "group": "Part I — Advanced",
+      "pages": [
+        "modules/27-pagination-idempotency",
+        "modules/28-task-queues"
+      ]
+    },
+    {
+      "group": "Reference",
+      "pages": [
+        "reference/architecture",
+        "reference/glossary",
+        "reference/cheatsheet",
+        "reference/faq"
+      ]
+    },
+    {
+      "group": "Exercise solutions",
+      "pages": [
+        "exercises/01-solution",
+        "exercises/02-solution",
+        "exercises/03-solution",
+        "exercises/04-solution",
+        "exercises/05-solution",
+        "exercises/06-solution",
+        "exercises/07-solution",
+        "exercises/08-solution",
+        "exercises/09-solution",
+        "exercises/10-solution",
+        "exercises/10b-solution",
+        "exercises/11-solution",
+        "exercises/12-solution",
+        "exercises/13-solution",
+        "exercises/13b-solution",
+        "exercises/14-solution",
+        "exercises/15-solution",
+        "exercises/16-solution",
+        "exercises/17-solution",
+        "exercises/17b-solution",
+        "exercises/17c-solution",
+        "exercises/18-solution",
+        "exercises/18b-solution",
+        "exercises/19-solution",
+        "exercises/20-solution",
+        "exercises/21-solution",
+        "exercises/22-solution",
+        "exercises/22b-solution",
+        "exercises/23-solution",
+        "exercises/24-solution",
+        "exercises/25-solution",
+        "exercises/26-solution",
+        "exercises/26b-solution",
+        "exercises/26c-solution",
+        "exercises/27-solution",
+        "exercises/28-solution"
+      ]
+    }
+  ]
+}

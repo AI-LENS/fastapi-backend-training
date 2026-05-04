@@ -1,0 +1,44 @@
+---
+title: "15 · Solution"
+description: "Emit a started event."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/services/screening_service.py
+async def _job():
+    async with db_factory() as db:
+        screening = await get_screening(db, screening_id)
+        if screening.status != "submitted":
+            return
+        await repo.update_status(db, screening, status="reviewing")
+
+        await progress.emit(
+            screening_id,
+            ProgressEvent(
+                event_type="started",
+                screening_id=str(screening_id),
+            ),
+        )
+
+        async def on_stage(result):
+            await progress.emit(...)
+        # ... rest unchanged
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why is this so easy?">
+    `ProgressManager.emit` doesn't care what `event_type` is — it's just a string forwarded to subscribers. The contract is "publishers and subscribers agree on event names". For now, you're both, so adding a new one is a one-liner.
+  </Accordion>
+  <Accordion title="Should event types be an enum?">
+    Yes, in production. Catches typos. We left it as a string for simplicity; you'd add `class EventType(str, Enum): STARTED = "started"` and use it both ends.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 16: JWT auth" icon="shield" href="/modules/16-jwt-auth" />

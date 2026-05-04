@@ -1,0 +1,67 @@
+---
+title: "24 · Solution"
+description: "Startup log of non-secret config."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/config.py
+class Settings(BaseSettings):
+    # ... existing fields ...
+
+    @property
+    def db_dialect(self) -> str:
+        return self.db_url.split(":")[0].split("+")[0]
+
+    def safe_dump(self) -> dict:
+        """Dict of non-secret config, suitable for logging."""
+        return {
+            "app_name": self.app_name,
+            "app_version": self.app_version,
+            "log_level": self.log_level,
+            "api_prefix": self.api_prefix,
+            "db_dialect": self.db_dialect,
+            "cors_origins": self.cors_origins,
+            "default_list_limit": self.default_list_limit,
+            "slow_request_ms": self.slow_request_ms,
+            "access_token_minutes": self.access_token_minutes,
+            "refresh_token_days": self.refresh_token_days,
+        }
+
+    def __repr__(self) -> str:
+        secrets_redacted = {**self.model_dump(), "secret_key": "***", "db_url": "***"}
+        return f"Settings({secrets_redacted})"
+```
+
+```python app/main.py
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("startup", **settings.safe_dump())
+    # ... rest
+```
+
+## Verify
+
+```bash
+uv run uvicorn app.main:app --port 8000
+# Logs include:
+# {"event": "startup", "app_name": "...", "db_dialect": "sqlite", ...}
+# But NOT: db_url with password, or secret_key
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why a `safe_dump` method on Settings?">
+    Centralizes the "what's safe to log". Whoever adds a new field has one place to update. Without it, log statements scatter across files and forget to redact.
+  </Accordion>
+  <Accordion title="Could I auto-detect secrets by name?">
+    Yes — if a field name contains `key`, `secret`, `password`, `token`, redact it. Fragile but useful as a default. Combine with explicit allow-list.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 25: Docker" icon="server" href="/modules/25-docker" />

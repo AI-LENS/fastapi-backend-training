@@ -1,0 +1,71 @@
+---
+title: "17b · Solution"
+description: "Field-level redaction via summary view."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Schema
+
+```python app/schemas/screening.py
+class ScreeningSummaryResponse(BaseModel):
+    """Minimal screening view — safe for any authenticated user to see."""
+    id: UUID
+    site_id: str
+    status: str
+    created_at: datetime
+    model_config = {"from_attributes": True}
+```
+
+## Service
+
+```python app/services/screening_service.py
+async def get_screening_summary(uow, screening_id: UUID) -> Screening:
+    """No object-level check — the response schema does the redaction.
+
+    Use case: coordinator at Site A wants to verify a Site B screening
+    exists (e.g., for cross-site coordination) without seeing medical fields.
+    """
+    async with uow:
+        screening = await repo.get_by_id(uow.session, screening_id)
+        if screening is None:
+            raise ScreeningNotFound(f"Screening {screening_id} not found")
+        return screening
+```
+
+## Route
+
+```python app/routers/screenings.py
+from app.schemas.screening import ScreeningSummaryResponse
+
+
+@router.get("/{screening_id}/summary", response_model=ScreeningSummaryResponse)
+async def get_screening_summary(
+    screening_id: UUID,
+    uow: UnitOfWork = Depends(get_uow),
+):
+    return await service.get_screening_summary(uow, screening_id)
+```
+
+## Verify
+
+```bash
+# Bob (SITE-002) gets summary for Alice's (SITE-001) screening
+curl -H "Authorization: Bearer $BOB" http://localhost:8000/api/v1/screenings/$SID/summary | jq
+# Returns minimal fields — no age, no diagnosis, no medications
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why does `response_model` enforce redaction?">
+    FastAPI filters the returned object to exactly the fields declared in `response_model`. Even if the service hands back a full ORM object, the response only contains the schema's fields. **No information leak by accident.**
+  </Accordion>
+  <Accordion title="Could I have used the service to filter instead?">
+    Yes — return a tuple or dataclass with only the safe fields. The response model approach is simpler and declarative; the service approach gives you more dynamic control (e.g., "redact based on role"). Both are valid.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 17c: Audit logs" icon="book" href="/modules/17c-audit-logs" />

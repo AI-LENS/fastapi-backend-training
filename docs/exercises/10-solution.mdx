@@ -1,0 +1,58 @@
+---
+title: "10 · Solution"
+description: "A pagination dependency."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/dependencies.py
+from dataclasses import dataclass
+
+
+@dataclass
+class Pagination:
+    limit: int
+    offset: int
+
+
+def get_pagination(limit: int = 50, offset: int = 0) -> Pagination:
+    """Return validated pagination params. Caps `limit` at 100, clamps `offset` to >= 0."""
+    return Pagination(limit=min(max(limit, 1), 100), offset=max(offset, 0))
+```
+
+```python app/routers/screenings.py
+from app.dependencies import Pagination, get_db_session, get_pagination
+
+
+@router.get("", response_model=list[ScreeningResponse])
+async def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    pagination: Pagination = Depends(get_pagination),
+    db: AsyncSession = Depends(get_db_session),
+):
+    return await service.list_screenings(
+        db,
+        site_id=site_id,
+        status=status,
+        limit=pagination.limit,
+        # offset will be wired in when the repo supports it (Module 27)
+    )
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why cap `limit` at 100?">
+    DoS protection. A client sending `limit=10000000` could pull the whole table; capping forces them to paginate. Module 27 covers proper cursor pagination.
+  </Accordion>
+  <Accordion title="Why `min(max(limit, 1), 100)` and not `Field` constraints?">
+    Both work. The dep approach is composable — any other route can use `get_pagination` without redeclaring the constraints. Schema validation works for body params; the dep approach works for query params.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 11: Custom exceptions" icon="shield" href="/modules/11-exceptions" />

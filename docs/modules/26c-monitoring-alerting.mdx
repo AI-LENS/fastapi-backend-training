@@ -1,0 +1,334 @@
+---
+title: "26c · Monitoring & alerting"
+description: "Alerts on golden signals, SLOs, runbooks. The bridge from observable to actionable."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~30 lines (YAML rules) · **Outcome:** Alerts when latency, errors, or queue depth misbehave. Runbooks for each alert.
+</Tip>
+
+## Concept
+
+Module 21 built the metrics. This module turns them into **action**:
+
+```
+metric → alert rule → notification → human → runbook → fix
+```
+
+Skip any step and observability is theater.
+
+### Pick alerts based on SLOs
+
+A **Service Level Objective** is a number you commit to:
+
+> "p99 latency < 500ms over a rolling 1-hour window, 99.9% of the time."
+
+That sentence implies the alert: when the rolling p99 exceeds 500ms long enough that you'd burn your error budget, page someone.
+
+### Don't alert on everything
+
+| Alert this | Skip this |
+|---|---|
+| User-visible degradation (latency, error rate spike) | Random background log warnings |
+| Saturation approaching limits | Each individual error |
+| Persistent failure of critical services | Intermittent retryable failures |
+| SLO budget burning fast | Internal counters being non-zero |
+
+**Alert fatigue** is the #1 reason teams ignore alerts. Pruning matters.
+
+## Walkthrough
+
+We'll define alerts in **Prometheus Alertmanager** rules — works with any Prometheus-compatible system (Grafana Cloud, Datadog, etc.).
+
+### Step 1 — Define SLOs
+
+```yaml ops/slos.yml
+service: enrollment-api
+slos:
+  - name: api-availability
+    target: 99.9%
+    indicator: ratio
+    window: 30d
+    formula: |
+      sum(rate(enrollment_http_requests_total{status!~"5.."}[5m]))
+      /
+      sum(rate(enrollment_http_requests_total[5m]))
+
+  - name: api-latency
+    target: 99%   # 99% of requests under threshold
+    threshold: 500ms
+    window: 30d
+    formula: |
+      histogram_quantile(0.99, sum(rate(enrollment_http_request_duration_seconds_bucket[5m])) by (le))
+
+  - name: pipeline-success-rate
+    target: 99%
+    window: 7d
+    formula: |
+      rate(enrollment_pipeline_runs_total{outcome!="failed"}[1h])
+      /
+      rate(enrollment_pipeline_runs_total[1h])
+```
+
+### Step 2 — Alert rules
+
+<Note>
+  These alert expressions reference Prometheus metric names — `enrollment_http_requests_total`, `enrollment_http_request_duration_seconds_bucket`, `enrollment_pipeline_runs_total`, `enrollment_worker_queue_size`, `enrollment_domain_errors_total`. They must match what you registered in **Module 21**'s `app/core/metrics.py`. If your metrics use a different prefix or label set, rename in both places before applying.
+</Note>
+
+```yaml ops/alerts.yml
+groups:
+- name: enrollment-api
+  rules:
+
+  # ─── Latency ────────────────────────────────────
+  - alert: ApiHighLatency
+    expr: |
+      histogram_quantile(0.99,
+        sum(rate(enrollment_http_request_duration_seconds_bucket[5m])) by (le, path)
+      ) > 0.5
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "p99 latency > 500ms on {{ $labels.path }}"
+      description: "p99 has been over 500ms for 10 minutes."
+      runbook: "https://internal.example.com/runbooks/api-high-latency"
+
+  # ─── Errors ────────────────────────────────────
+  - alert: ApiErrorRateHigh
+    expr: |
+      sum(rate(enrollment_http_requests_total{status=~"5.."}[5m]))
+      /
+      sum(rate(enrollment_http_requests_total[5m]))
+      > 0.01
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "5xx error rate > 1%"
+      description: "More than 1% of requests are 5xx for 5 minutes."
+      runbook: "https://internal.example.com/runbooks/api-errors"
+
+  # ─── Queue ────────────────────────────────────
+  - alert: WorkerQueueSaturated
+    expr: enrollment_worker_queue_size > 80
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Worker queue size > 80"
+      description: "Background queue has been saturated for 5 minutes."
+      runbook: "https://internal.example.com/runbooks/worker-saturated"
+
+  # ─── DLQ ────────────────────────────────────
+  - alert: DeadLetterQueueGrowing
+    expr: |
+      increase(enrollment_pipeline_runs_total{outcome="failed"}[1h]) > 5
+    for: 0m
+    labels:
+      severity: warning
+    annotations:
+      summary: "More than 5 pipeline failures in the last hour"
+      description: "Check DLQ at /api/v1/admin/jobs?status=dead_letter"
+      runbook: "https://internal.example.com/runbooks/dlq-growth"
+
+  # ─── Probe ────────────────────────────────────
+  - alert: ApiUnreachable
+    expr: up{job="enrollment-api"} == 0
+    for: 2m
+    labels:
+      severity: critical
+    annotations:
+      summary: "API instance unreachable"
+      description: "Prometheus can't scrape /metrics for 2+ minutes."
+      runbook: "https://internal.example.com/runbooks/api-down"
+
+  # ─── Audit ────────────────────────────────────
+  - alert: AccessDeniedSpike
+    expr: |
+      increase(enrollment_domain_errors_total{code="forbidden"}[5m]) > 50
+    for: 0m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Spike in forbidden errors — possible probe attack"
+      description: "Check audit log for the actor pattern."
+      runbook: "https://internal.example.com/runbooks/access-spike"
+```
+
+### Step 3 — Alertmanager routing (sketch)
+
+```yaml ops/alertmanager.yml
+route:
+  receiver: slack-warnings
+  routes:
+    - match:
+        severity: critical
+      receiver: pagerduty
+    - match:
+        severity: warning
+      receiver: slack-warnings
+
+receivers:
+  - name: pagerduty
+    pagerduty_configs:
+      - service_key: <secret>
+  - name: slack-warnings
+    slack_configs:
+      - api_url: <webhook>
+        channel: "#alerts-warning"
+```
+
+### Step 4 — Runbook template
+
+For every alert, write a runbook *before* it fires.
+
+```markdown ops/runbooks/api-high-latency.md
+# Runbook: API High Latency
+
+**Alert:** `ApiHighLatency`
+**Severity:** warning
+**Symptom:** p99 latency > 500ms for 10+ minutes on a specific path
+
+## Diagnosis steps
+
+1. Check the [Grafana latency dashboard](https://grafana...).
+2. Identify which path is slow — narrow by `path` label.
+3. Check correlated metrics:
+   - DB pool utilization (saturated → DB slowness)
+   - Worker queue size (saturated → all CPU on workers)
+   - 5xx error rate (errors → cascading slowness from retries)
+4. Pick a slow request: query logs for the request_id, follow the trace.
+
+## Common causes
+
+| Cause | How to confirm | Fix |
+|---|---|---|
+| DB query slow | Query logs for `slow_query` events | Add an index; review the query |
+| External API slow | Trace shows long span on outbound | Add timeout; circuit breaker |
+| Worker saturation | Worker queue gauge climbing | Scale workers or add concurrency cap |
+| Memory leak (slow GC) | Memory metric growing unbounded | Restart instance (gunicorn `max_requests` should auto-handle); investigate leak |
+
+## Mitigation (during incident)
+
+- Scale up the API tier (add instances)
+- Reduce traffic if intentional load test (cancel it)
+
+## Postmortem
+
+After resolution, document:
+1. Trigger
+2. Detection time vs incident start time
+3. Resolution
+4. Action items (alert tuning, code fixes, runbook updates)
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="What does `for: 10m` mean?">
+    The condition must be true for 10 consecutive minutes before firing. Prevents flapping alerts on momentary spikes. Critical alerts use shorter `for:` (2-5m), warnings longer.
+  </Accordion>
+  <Accordion title="Severity: warning vs critical?">
+    Warning → goes to a Slack channel; humans see during business hours. Critical → pages someone (PagerDuty, Opsgenie). Reserve critical for "user-visible outage". Most alerts should be warnings.
+  </Accordion>
+  <Accordion title="Why a runbook before the alert fires?">
+    At 3 AM, the on-call engineer doesn't know your system as well as you do. A runbook lets them resolve common cases without escalation. Without it, every alert involves waking up two people.
+  </Accordion>
+  <Accordion title="What's an 'error budget'?">
+    The acceptable error fraction implied by your SLO. If SLO is 99.9% availability, your budget is 0.1% — about 43 minutes per month. When the budget burns fast, it triggers a stronger alert.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Set up Prometheus locally (optional)">
+    Create a minimal scrape config that points at the API's `/metrics` endpoint and loads your alert rules:
+
+    ```yaml ops/prometheus.yml
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
+    scrape_configs:
+      - job_name: enrollment-api
+        static_configs:
+          - targets: ["api:8000"]
+    ```
+
+    Then bring up Prometheus next to the API:
+
+    ```yaml docker-compose.override.yml
+    services:
+      prometheus:
+        image: prom/prometheus:latest
+        volumes:
+          - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml
+          - ./ops/alerts.yml:/etc/prometheus/alerts.yml
+        ports: ["9090:9090"]
+    ```
+    Open http://localhost:9090 → Alerts to see your rules.
+  </Step>
+  <Step title="Visualize in Grafana (optional)">
+    Add a `grafana` service. Import the Prometheus data source. Build a dashboard from the `enrollment_*` metrics.
+  </Step>
+  <Step title="Drill: simulate an alert">
+    Run the load test from Module 22b at 200 users. Watch p99 climb. If it exceeds 500ms for 10 minutes, the alert fires (in your Prometheus + Alertmanager setup).
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="How many alerts is too many?">
+    If your team groans when alerts fire, you have too many. A reasonable cadence: 1-3 critical alerts per week, 5-10 warnings. Many noisy alerts → tune (raise threshold, add `for:`, group), don't ignore.
+  </Accordion>
+  <Accordion title="What if I don't have on-call?">
+    Then severity=warning is sufficient — alerts go to a channel humans see during hours. Don't wire `critical` to anything that requires waking people up if no one is paid to wake up.
+  </Accordion>
+  <Accordion title="What about logs-based alerts (e.g., 'specific error string')?">
+    Some systems support it. Generally prefer counter metrics (`logger.error → metric.inc()`) over log scraping. Log alerts are slower and more brittle.
+  </Accordion>
+  <Accordion title="My SLO is 99.9% but achievable is 99.5% — what do I do?">
+    Don't commit to an SLO you can't meet — you'll fire alerts forever. Either invest in reliability or revise the SLO to match achievable. Trust comes from honesty.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add an alert: **ScreeningStuckInReviewing** — fires if the **oldest** screening in `reviewing` status is older than 30 minutes.
+
+    1. Add a Prometheus gauge `enrollment_oldest_reviewing_age_seconds` updated periodically by a small cron-style task in lifespan.
+    2. Add an alert rule: `enrollment_oldest_reviewing_age_seconds > 1800 for 5m`.
+    3. Write a runbook: what would cause this, what to check, how to recover.
+  </Tab>
+  <Tab title="Hint">
+    Update the gauge from a periodic asyncio task: every 60s, query the DB for `MIN(created_at) where status='reviewing'`, compute the age, set the gauge.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/26c-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **A metric without an alert is a dashboard. A metric with an alert is a contract.** You're saying: "if this exceeds X, I will respond". Without that commitment, observability is pretty graphs no one looks at. With it, observability becomes the difference between knowing about issues before customers and learning from angry tweets.
+</Tip>
+
+## Real-world reference
+
+AnnotateHub doesn't have monitoring set up — same as most non-Ops-mature codebases. Adding it would be a high-impact production-readiness improvement.
+
+## Next module
+
+<Card title="Module 27: Pagination & idempotency" icon="link" href="/modules/27-pagination-idempotency">
+  Cursor pagination and idempotency keys for safe retries.
+</Card>

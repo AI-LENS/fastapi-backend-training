@@ -1,0 +1,45 @@
+---
+title: "05 · Solution"
+description: "Health check that pings the DB."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/main.py
+from fastapi import Depends, HTTPException
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+
+
+@app.get("/health/db")
+async def health_db(db: AsyncSession = Depends(get_db)):
+    try:
+        await db.execute(text("SELECT 1"))
+        return {"db": "ok"}
+    except SQLAlchemyError as exc:
+        logger.warning("DB health check failed: %s", exc)
+        raise HTTPException(status_code=503, detail={"db": "unreachable"})
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why `text('SELECT 1')` instead of just `'SELECT 1'`?">
+    SQLAlchemy 2.0 requires raw SQL strings to be wrapped in `text()` to avoid accidental SQL injection. It's a safety guard, not a performance thing.
+  </Accordion>
+  <Accordion title="Why catch `SQLAlchemyError` not `Exception`?">
+    Be specific about what you're catching. `Exception` would swallow programming bugs (typos, AttributeError) and report them as DB issues, hiding real problems.
+  </Accordion>
+  <Accordion title="Why log and raise?">
+    Logging gives ops a record. Raising returns a clean 503 to the caller. Doing both is the standard pattern.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 06: Models" icon="database" href="/modules/06-models" />

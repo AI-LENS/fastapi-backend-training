@@ -1,0 +1,359 @@
+---
+title: "09 · Service layer"
+description: "Business logic. Decisions. Transaction boundaries. The layer that holds the rules."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~20 lines · **Outcome:** Routes are pure orchestration. Business rules live in `app/services/`.
+</Tip>
+
+## Concept
+
+You moved SQL out of routes into repos in Module 08. But there's still business logic in routes:
+
+```python
+if screening.status != "submitted":
+    raise HTTPException(409, ...)
+```
+
+That's a decision, not orchestration. Decisions belong in **services**.
+
+```
+Route ──► Service ──► Repository ──► DB
+        (decisions)  (queries)
+```
+
+### What lives in a service
+
+<CardGroup cols={2}>
+  <Card title="Yes" icon="check">
+    - "Can this be deleted?"
+    - "If eligible, mark enrolled and assign subject ID"
+    - "Validate the screening's site exists"
+    - "Generate the next subject ID"
+    - Multi-step workflows
+  </Card>
+  <Card title="No" icon="ban">
+    - SQL (that's a repo)
+    - HTTP status codes (that's a route)
+    - File parsing / heavy computation (that's a pipeline)
+    - Returning Response objects
+  </Card>
+</CardGroup>
+
+### The dialect rule
+
+A service speaks **domain language**. Compare:
+
+```python
+# Route — speaks HTTP
+raise HTTPException(409, detail="...")
+
+# Service — speaks domain
+raise CannotDeleteEnrolledScreening(screening.id)
+```
+
+Module 11 makes this clean with custom exceptions. For now we'll use `ValueError` and translate at the route boundary.
+
+## Walkthrough
+
+### Step 1 — Create the service
+
+```python app/services/__init__.py
+# empty
+```
+
+<Note>
+  This module imports `site_repository`, which you wrote in the **Module 08 exercise**. If you skipped that exercise, complete it now, or paste this minimal version:
+
+  ```python app/repositories/site_repository.py
+  from sqlalchemy import select
+  from sqlalchemy.ext.asyncio import AsyncSession
+  from app.models.site import Site
+
+  async def get_by_id(db: AsyncSession, site_id: str) -> Site | None:
+      return await db.get(Site, site_id)
+  ```
+</Note>
+
+```python app/services/screening_service.py
+"""Business logic for screenings.
+
+Routes orchestrate; this layer decides.
+"""
+from uuid import UUID, uuid4
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.screening import Screening
+from app.repositories import screening_repository as repo
+from app.repositories import site_repository
+from app.schemas.screening import ScreeningCreate
+
+
+# Exception hierarchy — Module 11 formalizes this
+class ServiceError(Exception):
+    """Base class for service-level errors. Routes translate to HTTP."""
+
+
+class ScreeningNotFound(ServiceError):
+    pass
+
+
+class InvalidSite(ServiceError):
+    pass
+
+
+class IneligibleScreening(ServiceError):
+    pass
+
+
+class CannotDelete(ServiceError):
+    pass
+
+
+class AlreadyEnrolled(ServiceError):
+    pass
+
+
+# ─── operations ───────────────────────────────────────────────
+
+async def submit_screening(db: AsyncSession, payload: ScreeningCreate) -> Screening:
+    """Create a new screening. Validates the site exists."""
+    site = await site_repository.get_by_id(db, payload.site_id)
+    if site is None or not site.active:
+        raise InvalidSite(f"Site {payload.site_id} is unknown or inactive")
+
+    return await repo.create(db, **payload.model_dump())
+
+
+async def get_screening(db: AsyncSession, screening_id: UUID) -> Screening:
+    screening = await repo.get_by_id(db, screening_id)
+    if screening is None:
+        raise ScreeningNotFound(f"Screening {screening_id} not found")
+    return screening
+
+
+async def list_screenings(
+    db: AsyncSession,
+    *,
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[Screening]:
+    return await repo.list_filtered(db, site_id=site_id, status=status, limit=limit)
+
+
+async def cancel_screening(db: AsyncSession, screening_id: UUID) -> None:
+    """Cancel = delete a still-pending screening."""
+    screening = await get_screening(db, screening_id)
+    if screening.status != "submitted":
+        raise CannotDelete(
+            f"Screening {screening_id} is in status {screening.status} and cannot be deleted"
+        )
+    await repo.delete(db, screening)
+
+
+async def enroll_screening(db: AsyncSession, screening_id: UUID) -> Screening:
+    """Convert an eligible screening to an enrolled subject. Idempotent on already-enrolled."""
+    screening = await get_screening(db, screening_id)
+
+    if screening.status == "enrolled":
+        raise AlreadyEnrolled(f"Screening {screening_id} is already enrolled as {screening.subject_id}")
+
+    if screening.eligibility_result != "eligible":
+        raise IneligibleScreening(
+            f"Screening {screening_id} is not eligible (result: {screening.eligibility_result})"
+        )
+
+    subject_id = _generate_subject_id()
+    return await repo.mark_enrolled(db, screening, subject_id=subject_id)
+
+
+def _generate_subject_id() -> str:
+    """Generate a short, human-friendly subject ID. Module 27 makes this collision-safe."""
+    return "S-" + uuid4().hex[:8].upper()
+```
+
+### Step 2 — Refactor the router
+
+```python app/routers/screenings.py
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.database import get_db
+from app.schemas.screening import ScreeningCreate, ScreeningResponse
+from app.services import screening_service as service
+
+router = APIRouter(prefix="/screenings", tags=["screenings"])
+
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+async def create_screening(payload: ScreeningCreate, db: AsyncSession = Depends(get_db)):
+    try:
+        return await service.submit_screening(db, payload)
+    except service.InvalidSite as exc:
+        raise HTTPException(400, detail=str(exc))
+
+
+@router.get("", response_model=list[ScreeningResponse])
+async def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    # `default_list_limit` came from Module 04's exercise. Hardcode `50` if you skipped it.
+    limit: int = settings.default_list_limit,
+    db: AsyncSession = Depends(get_db),
+):
+    return await service.list_screenings(db, site_id=site_id, status=status, limit=limit)
+
+
+@router.get("/{screening_id}", response_model=ScreeningResponse)
+async def get_screening(screening_id: UUID, db: AsyncSession = Depends(get_db)):
+    try:
+        return await service.get_screening(db, screening_id)
+    except service.ScreeningNotFound as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+@router.post("/{screening_id}/enroll", response_model=ScreeningResponse)
+async def enroll(screening_id: UUID, db: AsyncSession = Depends(get_db)):
+    try:
+        return await service.enroll_screening(db, screening_id)
+    except service.ScreeningNotFound as exc:
+        raise HTTPException(404, detail=str(exc))
+    except service.AlreadyEnrolled as exc:
+        raise HTTPException(409, detail=str(exc))
+    except service.IneligibleScreening as exc:
+        raise HTTPException(422, detail=str(exc))
+
+
+@router.delete("/{screening_id}", status_code=204)
+async def delete_screening(screening_id: UUID, db: AsyncSession = Depends(get_db)):
+    try:
+        await service.cancel_screening(db, screening_id)
+    except service.ScreeningNotFound as exc:
+        raise HTTPException(404, detail=str(exc))
+    except service.CannotDelete as exc:
+        raise HTTPException(409, detail=str(exc))
+```
+
+The route is now a **translator**: domain exceptions → HTTP responses. Module 11 makes the translation centralized so each route doesn't need its own try/except chain.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why services raise exceptions instead of returning error tuples?">
+    Pythonic. Forces callers to handle the failure (or let it propagate). Compare the alternative: `result, err = service.foo(...)` — easy to forget the `err` check, leading to silent bugs.
+  </Accordion>
+  <Accordion title="Why a `ServiceError` base class?">
+    Catch-all in case Module 11's central handler wants to translate any unhandled service error to 500. Also makes it easy to grep — every business exception inherits from one place.
+  </Accordion>
+  <Accordion title="`if screening.status == 'enrolled': raise AlreadyEnrolled(...)`">
+    Idempotency consideration: if the same screening was just enrolled, retrying the enroll call shouldn't silently create a *second* subject ID. Raising lets the caller know "this is already done". Module 27 covers proper idempotency keys.
+  </Accordion>
+  <Accordion title="Why `_generate_subject_id` with a leading underscore?">
+    Convention: leading underscore means "private to this module". The router shouldn't call this; only the service does. This is doc, not enforcement (Python won't stop you).
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit a screening with a bad site_id">
+    ```bash
+    curl -i -X POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"BOGUS","candidate_initials":"AB","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["x"]}'
+    ```
+    Expect 400 with `Site BOGUS is unknown or inactive`.
+  </Step>
+  <Step title="Try to enroll a non-eligible screening">
+    Submit one (status will be `submitted`, not `eligible`), then:
+    ```bash
+    curl -i -X POST http://localhost:8000/api/v1/screenings/<id>/enroll
+    ```
+    Expect 422 with `not eligible`.
+  </Step>
+  <Step title="Manually mark eligible (we're cheating until Module 14)">
+    ```bash
+    sqlite3 enrollment.db "UPDATE screenings SET status='eligible', eligibility_result='eligible' WHERE id='<id>'"
+    ```
+    Then call enroll again — you should get a 200 with a `subject_id` like `"S-A8F3B221"`.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Why does the service know about repos but not routes?">
+    Dependency direction. Routes call services; services call repos. Reversing this (repo importing service, or service importing route) creates a cycle and couples layers that should be independent.
+  </Accordion>
+  <Accordion title="Should I make the service async even when it's just calling repos?">
+    Yes. Async is contagious — once `repo.X` is async, anything that awaits it must also be async. Worth it: under load, sync services kill performance.
+  </Accordion>
+  <Accordion title="Where does input validation belong — schema or service?">
+    Schema for **shape and ranges** (`age >= 0`, must be valid email). Service for **business invariants** (`site must exist`, `cannot enroll without consent`).
+  </Accordion>
+  <Accordion title="Should each service function commit its own transaction?">
+    For now yes (the repo commits). For multi-step workflows that must be atomic (Module 14 has one), the service controls the transaction. We'll cover that pattern then.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a service operation: **`update_eligibility(db, screening_id, *, eligible: bool, failed_criteria: list[str])`**.
+
+    Behavior:
+    - Loads the screening; raises `ScreeningNotFound` if missing.
+    - If the screening is already in a terminal state (`enrolled` or `ineligible`), raise a new exception `AlreadyDecided`.
+    - Otherwise, updates status to `eligible` or `ineligible` and stores the failed criteria.
+
+    Then add a temporary route `POST /screenings/{id}/_set_eligibility` that calls this service. (We'll replace this with the real pipeline in Module 14.)
+
+    You'll write ~20 lines.
+  </Tab>
+  <Tab title="Hint">
+    The service should call `repo.update_status(...)` with the right kwargs. The route translates `AlreadyDecided` → 409.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/09-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+# Set a submitted screening to eligible
+curl -i -X POST http://localhost:8000/api/v1/screenings/<id>/_set_eligibility \
+  -H "Content-Type: application/json" \
+  -d '{"eligible": true, "failed_criteria": []}'
+
+# Now enroll succeeds
+curl -i -X POST http://localhost:8000/api/v1/screenings/<id>/enroll
+# 200 with subject_id
+
+# Try to set eligibility again — should be 409
+curl -i -X POST http://localhost:8000/api/v1/screenings/<id>/_set_eligibility \
+  -H "Content-Type: application/json" \
+  -d '{"eligible": true, "failed_criteria": []}'
+```
+
+## Insight
+
+<Tip>
+  **A service function should read like a paragraph of business policy.** `enroll_screening`: "if not found, complain; if already enrolled, complain; if not eligible, complain; otherwise generate a subject ID and mark it." That's exactly what your route used to do — except now it's documented in domain language and reusable from anywhere (a CLI, another service, a Celery task).
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/services/job_service.py` — 167 lines of pure orchestration. Notice zero raw SQL, zero `HTTPException`, only repo calls and decisions.
+
+## Next module
+
+<Card title="Module 10: Dependency injection deep-dive" icon="link" href="/modules/10-dependency-injection">
+  `Depends()` in detail: sub-deps, scopes, and `dependency_overrides` for testing.
+</Card>

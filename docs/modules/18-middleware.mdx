@@ -1,0 +1,297 @@
+---
+title: "18 · Middleware"
+description: "CORS, request IDs, request logging, GZip — the cross-cutting layer."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~30 lines · **Outcome:** Every request gets a unique ID. Every response includes timing. Logs and errors carry the same correlation ID.
+</Tip>
+
+## Concept
+
+**Middleware** wraps every request/response. It runs *outside* your routes, in a layered onion:
+
+```
+Request  →  CORS  →  RequestID  →  Logging  →  GZip  →  [Route handler]  →  GZip  →  Logging  →  RequestID  →  CORS  →  Response
+```
+
+Each middleware can:
+- Inspect/modify the incoming request
+- Pass it to the next middleware (`call_next`)
+- Inspect/modify the outgoing response
+
+### What middleware is good for
+
+<CardGroup cols={2}>
+  <Card title="Yes" icon="check">
+    - CORS, GZip
+    - Request IDs
+    - Request/response logging
+    - Timing
+    - Auth that applies globally
+    - Rate limiting (Module 19)
+  </Card>
+  <Card title="No" icon="ban">
+    - Business logic (use services)
+    - Per-route validation (use schemas)
+    - Auth that varies per route (use deps)
+    - Long-running work (use workers)
+  </Card>
+</CardGroup>
+
+## Walkthrough
+
+### Step 1 — Request ID middleware
+
+```python app/middleware/__init__.py
+# empty
+```
+
+```python app/middleware/request_id.py
+"""Attach a unique ID to every request. Used for log correlation."""
+import logging
+from contextvars import ContextVar
+from uuid import uuid4
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+
+
+# A ContextVar makes the request_id reachable from anywhere in async code
+# (services, repos, workers) without threading it through every function.
+request_id_var: ContextVar[str | None] = ContextVar("request_id", default=None)
+
+logger = logging.getLogger(__name__)
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Generate or accept an X-Request-ID for every request.
+
+    Clients can pass `X-Request-ID` to correlate cross-service traces;
+    if absent we generate a fresh UUID.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        rid = request.headers.get("x-request-id") or str(uuid4())
+        token = request_id_var.set(rid)
+        try:
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = rid
+            return response
+        finally:
+            request_id_var.reset(token)
+
+
+def get_request_id() -> str | None:
+    """Read the current request's ID from anywhere in the call stack."""
+    return request_id_var.get()
+```
+
+### Step 2 — Request-logging middleware
+
+```python app/middleware/logging.py
+import logging
+import time
+
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from app.middleware.request_id import get_request_id
+
+logger = logging.getLogger("http.access")
+
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """Log a structured line for every request: method, path, status, duration."""
+
+    async def dispatch(self, request, call_next):
+        start = time.monotonic()
+        response = await call_next(request)
+        duration_ms = (time.monotonic() - start) * 1000
+
+        logger.info(
+            "%s %s -> %d in %.1fms",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            extra={
+                "request_id": get_request_id(),
+                "method": request.method,
+                "path": request.url.path,
+                "status": response.status_code,
+                "duration_ms": round(duration_ms, 1),
+            },
+        )
+        return response
+```
+
+### Step 3 — Wire them up (order matters)
+
+```python app/main.py
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+
+from app.middleware.logging import AccessLogMiddleware
+from app.middleware.request_id import RequestIDMiddleware
+
+
+def create_app():
+    app = FastAPI(...)
+
+    # Order: outer-most first.
+    # When a request arrives, middleware run top-to-bottom.
+    # When the response leaves, they run bottom-to-top.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(AccessLogMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    register_exception_handlers(app)
+    # ... routers
+    return app
+```
+
+<Note>
+  **Order is intentional**: CORS goes outermost (handles preflight before anything else). RequestID next (so logging can use it). Logging next (records what auth/handlers did). GZip innermost (compresses the final response).
+</Note>
+
+### Step 4 — Use the request ID in error responses
+
+```python app/main.py
+def register_exception_handlers(app):
+    @app.exception_handler(DomainError)
+    async def handle_domain_error(request, exc):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": exc.message,
+                    "details": exc.details,
+                    "request_id": get_request_id(),   # ← here
+                }
+            },
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request, exc):
+        logger.exception("Unhandled on %s %s", request.method, request.url.path)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "message": "Internal server error",
+                    "request_id": get_request_id(),
+                }
+            },
+        )
+```
+
+When a user reports "I got an error", they paste the `request_id`. You search logs by that ID and instantly find every log line, every audit entry, every metric for *that specific request*. **This is the single biggest debugging win in production**.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`ContextVar` — what's that?">
+    Python's standard way to store request-scoped data in async code. Like thread-locals, but for `asyncio`. Reading it from anywhere in the same task chain returns the same value; tasks don't share with each other. Perfect for "what's the current request_id" without passing it through every function signature.
+  </Accordion>
+  <Accordion title="Why does CORS have to be outermost?">
+    Browsers send a `OPTIONS /` preflight before any cross-origin POST. CORS middleware short-circuits these without invoking your routes. If CORS is *inside* (later than) other middleware, the preflight runs your auth/logging/etc. first — wasted work and possibly errors.
+  </Accordion>
+  <Accordion title="`response.headers['X-Request-ID']` — why echo it back?">
+    So the client knows the ID even if they didn't send one. Modern frontend logging libraries pick this up automatically and tag client-side errors with the same ID — letting you correlate frontend exceptions with backend logs.
+  </Accordion>
+  <Accordion title="Why `BaseHTTPMiddleware`?">
+    Starlette's base class for middleware that needs full request/response access. Slightly more overhead than ASGI-level middleware, but the API is far more readable. Use this unless you have specific perf needs.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Make a request, observe the response header">
+    ```bash
+    curl -i http://localhost:8000/
+    # Look for: X-Request-ID: <some-uuid>
+    ```
+  </Step>
+  <Step title="Provide your own request ID">
+    ```bash
+    curl -i -H "X-Request-ID: my-trace-123" http://localhost:8000/
+    # Response header echoes "my-trace-123"
+    ```
+  </Step>
+  <Step title="Provoke an error and look at the response">
+    ```bash
+    curl -i http://localhost:8000/api/v1/screenings/00000000-0000-0000-0000-000000000000
+    # Body includes: "request_id": "..." matching the header
+    ```
+  </Step>
+  <Step title="Check the access log">
+    Watch the Uvicorn console as you hit endpoints. Lines like:
+    ```
+    INFO http.access GET /api/v1/screenings -> 200 in 12.4ms
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Can I trust client-supplied X-Request-ID?">
+    For correlation, yes. **Don't trust it for security decisions** — a malicious client could supply duplicate IDs to confuse logs. Treat it as a *hint* for tracing.
+  </Accordion>
+  <Accordion title="What about background workers — they don't have a request?">
+    Set `request_id_var` manually before invoking the worker, with the originating request's ID. That way logs from the worker carry the same ID as the request that scheduled it. Module 20 wires this up via the worker dispatcher.
+  </Accordion>
+  <Accordion title="Should middleware ever raise?">
+    Yes — but be careful. If your middleware raises, FastAPI's normal exception handler runs. If you raise *before* `call_next`, the route never sees the request. Common case: rate-limit middleware that raises 429 immediately.
+  </Accordion>
+  <Accordion title="What's the difference between `add_middleware` and `dependencies=[Depends(...)]`?">
+    Middleware applies to **every** request, regardless of route. Dependencies apply only to declared routes. CORS = middleware. Auth on a router = dependencies (can vary per route).
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a **slow-request alert** middleware: log a `WARNING` whenever a request takes more than 500 ms.
+
+    1. New middleware `SlowRequestMiddleware` (in `app/middleware/slow.py`).
+    2. Threshold configurable via `Settings.slow_request_ms: int = 500`.
+    3. Log the offending path, method, duration. Include the request ID.
+    4. Mount it after `AccessLogMiddleware`.
+
+    Then deliberately add `await asyncio.sleep(0.6)` to a route to verify the warning fires.
+  </Tab>
+  <Tab title="Hint">
+    Same `dispatch` pattern as `AccessLogMiddleware`. Time the request, compare to `settings.slow_request_ms`, log if exceeded. Use `logging.getLogger("http.slow").warning(...)`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/18-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Request IDs are the closest thing to a debugging superpower in distributed systems.** Once every log line, audit entry, error response, and metric is tagged with the same ID, debugging stops being archaeological — you stop asking "what happened around 3:45 PM?" and start asking "what happened in request `abc123`?". One ID, one full picture.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/main.py:83-89` — CORS middleware. AnnotateHub doesn't have explicit request-ID middleware yet — a real gap.
+
+## Next module
+
+<Card title="Module 18b: Permission service pattern" icon="key" href="/modules/18b-permission-service">
+  Centralize all the object-level permission decisions from Module 17b into one auditable place.
+</Card>

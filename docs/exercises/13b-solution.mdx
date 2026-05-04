@@ -1,0 +1,98 @@
+---
+title: "13b · Solution"
+description: "Admin endpoint to view and retry DLQ items."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Schema
+
+```python app/schemas/job_record.py
+from datetime import datetime
+from uuid import UUID
+from pydantic import BaseModel
+
+
+class JobRecordOut(BaseModel):
+    id: UUID
+    job_type: str
+    target_id: str
+    status: str
+    attempts: int
+    last_error: str | None
+    last_error_at: datetime | None
+    model_config = {"from_attributes": True}
+```
+
+## Repo additions
+
+```python app/repositories/job_record_repository.py
+async def list_filtered(db, *, status: str | None = None, limit: int = 50):
+    stmt = select(JobRecord).order_by(JobRecord.last_error_at.desc().nullslast()).limit(limit)
+    if status:
+        stmt = stmt.where(JobRecord.status == status)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def reset_for_retry(db, record: JobRecord) -> None:
+    record.status = "queued"
+    record.attempts = 0
+    record.last_error = None
+    record.last_error_at = None
+    record.next_retry_at = None
+    await db.flush()
+```
+
+## Router
+
+```python app/routers/admin.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.dependencies import get_db_session
+from app.repositories import job_record_repository as repo
+from app.schemas.job_record import JobRecordOut
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+
+@router.get("/jobs", response_model=list[JobRecordOut])
+async def list_jobs(
+    status: str | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db_session),
+):
+    return await repo.list_filtered(db, status=status, limit=limit)
+
+
+@router.post("/jobs/{job_id}/retry", response_model=JobRecordOut)
+async def retry_job(job_id: UUID, db: AsyncSession = Depends(get_db_session)):
+    record = await repo.get_by_id(db, job_id)
+    if record is None:
+        raise HTTPException(404, "Job not found")
+    if record.status != "dead_letter":
+        raise HTTPException(409, f"Cannot retry job in status {record.status}")
+    await repo.reset_for_retry(db, record)
+    await db.commit()
+    # In production: publish "retry requested" event so a poller picks it up
+    # For training: trigger inline via run_with_policy (caller would re-construct work)
+    return record
+```
+
+Mount in `main.py`: `app.include_router(admin.router, prefix=settings.api_prefix)`.
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why is retrying complicated?">
+    The `_work` closure for the original job is gone — it lived in the worker process. To re-run, you need to **reconstruct** the work from the `payload` field on the JobRecord (that's what we stored it for). Module 28's external task queue handles this natively.
+  </Accordion>
+  <Accordion title="When would I want to see DLQ jobs?">
+    Daily: triage what's accumulating. After deploys: catch new bugs. Monitoring (Module 26c) should alert when DLQ grows past a threshold.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 14: Pipelines" icon="gear" href="/modules/14-pipelines" />

@@ -1,0 +1,332 @@
+---
+title: "13 · Workers"
+description: "Background work in FastAPI: BackgroundTasks, asyncio.create_task, ThreadPoolExecutor — and which to pick when."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~25 lines · **Outcome:** A `BackgroundTaskRunner` that processes screenings asynchronously. POST returns immediately; the worker runs eligibility checks in the background.
+</Tip>
+
+## Concept
+
+When you submit a screening, eligibility checks shouldn't block the API response. The pattern:
+
+```
+1. POST /screenings        ─►  service creates row, status=submitted
+2. service hands off       ─►  worker queue
+3. response returns 201    ─►  client gets ID immediately
+4. worker picks it up      ─►  status=reviewing → ... → eligible/ineligible
+```
+
+### The four levels of background work
+
+<CardGroup cols={2}>
+  <Card title="1. BackgroundTasks" icon="rocket">
+    Built into FastAPI. Runs **after** sending the response. Perfect for fire-and-forget like sending an email.
+  </Card>
+  <Card title="2. asyncio.create_task" icon="link">
+    Long-running, observable work that should outlive the request. Custom cancellation. Lives in the same process.
+  </Card>
+  <Card title="3. ThreadPoolExecutor" icon="server">
+    For CPU-bound or sync-library work. Doesn't block the event loop. Lives in the same process.
+  </Card>
+  <Card title="4. External queue" icon="globe">
+    Celery / Arq / RQ. Survives process restarts, distributes across machines, has retry/DLQ. Module 28.
+  </Card>
+</CardGroup>
+
+| Level | Survives restart? | Distributed? | Setup |
+|---|---|---|---|
+| 1. BackgroundTasks | No | No | Zero |
+| 2. asyncio.create_task | No | No | Zero |
+| 3. ThreadPool | No | No | Zero |
+| 4. External queue | Yes | Yes | Significant |
+
+For our training app, **Level 2 + Level 3 hybrid** matches AnnotateHub's pattern: a custom runner that schedules pipeline work on a thread pool and tracks state in the DB. We get most of the benefits without external dependencies.
+
+## Walkthrough
+
+### Step 1 — The minimal worker
+
+```python app/workers/__init__.py
+# empty
+```
+
+```python app/workers/task_runner.py
+"""Background task runner for screening pipeline jobs.
+
+Owns:
+  - A ThreadPoolExecutor for CPU/sync-library work
+  - A registry of running tasks (so we can cancel)
+
+Does NOT own:
+  - State machine (the service does)
+  - Decisions about what to run (the service hands it work)
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from typing import Awaitable, Callable
+from uuid import UUID
+
+logger = logging.getLogger(__name__)
+
+
+class BackgroundTaskRunner:
+    """Schedule async coroutines as background tasks. Track them so we can cancel."""
+
+    def __init__(self, executor: ThreadPoolExecutor):
+        self._executor = executor
+        self._tasks: dict[UUID, asyncio.Task] = {}
+
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        """Expose the thread pool for blocking-call escape hatches."""
+        return self._executor
+
+    def submit(self, key: UUID, coro_factory: Callable[[], Awaitable[None]]) -> None:
+        """Start a background coroutine, keyed for cancellation."""
+        if key in self._tasks and not self._tasks[key].done():
+            logger.warning("Task %s already running, ignoring duplicate submit", key)
+            return
+
+        async def runner():
+            try:
+                logger.info("Worker started: %s", key)
+                await coro_factory()
+                logger.info("Worker finished: %s", key)
+            except asyncio.CancelledError:
+                logger.info("Worker cancelled: %s", key)
+                raise
+            except Exception:
+                logger.exception("Worker failed: %s", key)
+
+        task = asyncio.create_task(runner())
+        self._tasks[key] = task
+
+    def cancel(self, key: UUID) -> bool:
+        task = self._tasks.get(key)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+    async def shutdown(self, timeout: float = 10.0) -> None:
+        """Cancel all running tasks and wait for them to finish."""
+        for task in self._tasks.values():
+            if not task.done():
+                task.cancel()
+        if self._tasks:
+            await asyncio.wait(self._tasks.values(), timeout=timeout)
+        self._executor.shutdown(wait=False)
+```
+
+### Step 2 — Wire into lifespan
+
+```python app/main.py
+from concurrent.futures import ThreadPoolExecutor
+from app.workers.task_runner import BackgroundTaskRunner
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ... existing migrations ...
+
+    app.state.executor = ThreadPoolExecutor(max_workers=4)
+    app.state.task_runner = BackgroundTaskRunner(executor=app.state.executor)
+    logger.info("Worker ready")
+    yield
+
+    await app.state.task_runner.shutdown()
+    await close_db()
+```
+
+### Step 3 — Add a typed dep
+
+```python app/dependencies.py
+from app.workers.task_runner import BackgroundTaskRunner
+
+
+def get_task_runner(request: Request) -> BackgroundTaskRunner:
+    return request.app.state.task_runner
+```
+
+### Step 4 — A placeholder pipeline call
+
+We'll build the real eligibility pipeline in Module 14. For now, give the worker something to do:
+
+```python app/services/screening_service.py
+import asyncio
+from app.workers.task_runner import BackgroundTaskRunner
+
+async def run_eligibility_pipeline(
+    runner: BackgroundTaskRunner,
+    db_factory,
+    screening_id: UUID,
+) -> None:
+    """Spawn a background task that runs the eligibility check.
+
+    Module 14 replaces the body with a real pipeline.
+    """
+
+    async def _job():
+        # Use a fresh session per job (the request session is closed by now)
+        async with db_factory() as db:
+            screening = await get_screening(db, screening_id)
+            if screening.status != "submitted":
+                return
+            await repo.update_status(db, screening, status="reviewing")
+            await asyncio.sleep(2)  # simulate work — Module 14 replaces this
+            # Naive rule: eligible if not pregnant and age in [18, 75]
+            ineligible = (
+                screening.is_pregnant
+                or screening.has_liver_disease
+                or screening.in_other_trial
+                or not (18 <= screening.age <= 75)
+            )
+            if ineligible:
+                await repo.update_status(
+                    db, screening,
+                    status="ineligible", eligibility_result="ineligible",
+                    failed_criteria=["placeholder"],
+                )
+            else:
+                await repo.update_status(
+                    db, screening,
+                    status="eligible", eligibility_result="eligible",
+                )
+
+    runner.submit(screening_id, _job)
+```
+
+### Step 5 — Hook it into the create route
+
+```python app/routers/screenings.py
+from app.database import async_session
+from app.dependencies import get_task_runner
+from app.services.screening_service import run_eligibility_pipeline
+
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+async def create_screening(
+    payload: ScreeningCreate,
+    db: AsyncSession = Depends(get_db_session),
+    runner = Depends(get_task_runner),
+):
+    screening = await service.submit_screening(db, payload)
+    # Hand off to the worker. Note we pass `async_session` as a factory —
+    # the request session will be closed by the time the worker runs.
+    await run_eligibility_pipeline(runner, async_session, screening.id)
+    return screening
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why pass `async_session` (the factory) instead of `db` (the session)?">
+    Yield-based deps close the session when the route returns. The worker keeps running after the response is sent — by then the session is closed. Workers must open their own sessions.
+  </Accordion>
+  <Accordion title="`asyncio.create_task` vs `BackgroundTasks`">
+    `BackgroundTasks` runs **after the response is sent** but in the same request scope; once the request handler returns, the task can't outlive much. `asyncio.create_task` runs forever (until the loop stops or you cancel), letting you build long-running, observable workers. AnnotateHub uses the latter pattern for the same reason.
+  </Accordion>
+  <Accordion title="What happens if the API server restarts mid-job?">
+    The task is killed. The screening's row stays in `reviewing` status. On restart, you'd want a startup hook to scan for stuck `reviewing` rows and either resume or fail them. **This is the limitation of in-process workers** — Module 28 (Celery/Arq) makes jobs durable.
+  </Accordion>
+  <Accordion title="`max_workers=4` for the ThreadPoolExecutor — why 4?">
+    Rule of thumb: number of CPU cores for CPU-bound work, 2–4× cores for mixed work. 4 is a fine default; tune later when you see actual load.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Submit a screening">
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"ZZ","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["metformin"]}' | jq
+    ```
+    Status returned is `submitted`.
+  </Step>
+  <Step title="Poll status (use the ID from the response)">
+    ```bash
+    SID=<id-from-above>
+    curl -s http://localhost:8000/api/v1/screenings/$SID | jq .status
+    ```
+    Within ~2 seconds you'll see it transition: `submitted` → `reviewing` → `eligible`.
+  </Step>
+  <Step title="Test ineligibility">
+    Submit with `"is_pregnant": true`. Status moves to `ineligible`.
+  </Step>
+  <Step title="Watch logs">
+    The Uvicorn console shows: `Worker started: <id>` … `Worker finished: <id>`.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Why is the worker stored on `app.state` instead of as a global?">
+    Two reasons: (1) testing — `dependency_overrides` can replace it cleanly. (2) lifecycle — it's created in lifespan and torn down in lifespan, matching the app's life. Globals leak between tests.
+  </Accordion>
+  <Accordion title="What about `BackgroundTasks` for the email-on-enrollment use case?">
+    Perfect fit. Sending a notification doesn't need to outlive the request — `BackgroundTasks` (passed as a route param) runs the function after response, no persistent worker needed. We'll use this in Module 18.
+  </Accordion>
+  <Accordion title="What if the worker crashes mid-job?">
+    The task's exception is logged (line 28 of our runner). The screening row stays in `reviewing`. A real production system either retries automatically (Module 28) or has a sweep job that resets stuck rows.
+  </Accordion>
+  <Accordion title="Why pass a factory `async_session` and not a created session?">
+    See the box above on session lifecycle. Workers always open their own session.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a `cancel_pipeline(runner, screening_id)` service operation and a route `POST /screenings/{id}/cancel-pipeline`.
+
+    Behavior:
+    - If the runner has a task for this screening, cancel it.
+    - Set the screening's status back to `submitted` (so it can be re-run later).
+    - Return the updated screening.
+    - If no task is running for this screening, return `409 conflict` with `code: "no_pipeline_running"`.
+
+    You'll write ~15 lines.
+  </Tab>
+  <Tab title="Hint">
+    Use `runner.cancel(screening_id)`. It returns `True` if a task was cancelled, `False` otherwise. On success, call `repo.update_status(...)`. On false, raise a new `ConflictError` from `app.exceptions`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/13-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+# Submit (with sleep > 2s in pipeline this should be cancellable)
+SID=$(curl -sX POST http://localhost:8000/api/v1/screenings -H "Content-Type: application/json" \
+  -d '{"site_id":"SITE-001","candidate_initials":"XX","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["x"]}' | jq -r .id)
+
+# Cancel it within 2 seconds
+curl -X POST http://localhost:8000/api/v1/screenings/$SID/cancel-pipeline | jq .status
+# → "submitted"
+```
+
+## Insight
+
+<Tip>
+  **A worker isn't a different program — it's a function running on a different schedule.** The same Python process owns the API and the worker; they share imports, code, and the database. That's why the architecture stays clean: workers reuse services and repos. When you graduate to Celery (Module 28), this principle still holds — only the *transport* changes, not the structure of the work.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/workers/task_runner.py` — 122 lines. A more elaborate version of what we built, with progress tracking and per-stage cancellation hooks (which Module 14 introduces).
+
+## Next module
+
+<Card title="Module 14: Pipelines" icon="gear" href="/modules/14-pipelines">
+  Replace the `await asyncio.sleep(2)` placeholder with a real multi-stage eligibility pipeline.
+</Card>

@@ -1,0 +1,81 @@
+---
+title: "23 · Solution"
+description: "Full-flow + audit-log integration tests."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python tests/integration/test_screenings.py
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_full_screening_flow(client, alice_auth):
+    submit = await client.post(
+        "/api/v1/screenings", headers=alice_auth,
+        json={
+            "site_id": "SITE-001", "candidate_initials": "FF",
+            "age": 40, "sex": "F", "diagnosis": "Type 2 Diabetes",
+            "medications": ["metformin"], "is_pregnant": False,
+            "has_liver_disease": False, "in_other_trial": False,
+        },
+    )
+    assert submit.status_code == 201
+    sid = submit.json()["id"]
+
+    # Worker runs in background. Poll briefly.
+    for _ in range(20):
+        r = await client.get(f"/api/v1/screenings/{sid}", headers=alice_auth)
+        if r.json()["status"] in {"eligible", "ineligible"}:
+            break
+        await asyncio.sleep(0.05)
+
+    final = r.json()
+    assert final["status"] == "eligible"
+    assert final["eligibility_result"] == "eligible"
+
+
+@pytest.mark.asyncio
+async def test_audit_log_records_submission(client, alice_auth, admin_auth):
+    submit = await client.post(
+        "/api/v1/screenings", headers=alice_auth,
+        json={
+            "site_id": "SITE-001", "candidate_initials": "AU",
+            "age": 40, "sex": "F", "diagnosis": "Type 2 Diabetes",
+            "medications": ["metformin"], "is_pregnant": False,
+            "has_liver_disease": False, "in_other_trial": False,
+        },
+    )
+    sid = submit.json()["id"]
+
+    audit = await client.get(
+        "/api/v1/admin/audit?action=screening.submitted",
+        headers=admin_auth,
+    )
+    assert audit.status_code == 200
+    entries = audit.json()
+    assert any(e["resource_id"] == sid for e in entries)
+```
+
+## Verify
+
+```bash
+uv run pytest tests/integration/ -v -k "full_flow or audit"
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why poll instead of waiting fixed time?">
+    Tests run in CI on slow runners. A fixed `await asyncio.sleep(2)` either flakes (slow runner) or wastes time (fast runner). Polling with a short interval and bounded total wait is the right balance.
+  </Accordion>
+  <Accordion title="Why is the worker actually running here?">
+    Because we didn't override `get_task_runner`. The real `BackgroundTaskRunner` runs in the test process. For deterministic worker tests, override it with a sync runner or noop.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 24: Config & secrets" icon="key" href="/modules/24-config-secrets" />

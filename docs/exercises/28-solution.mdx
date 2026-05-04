@@ -1,0 +1,117 @@
+---
+title: "28 · Solution"
+description: "Outbox drainer with Arq enqueue."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+### Add Arq
+
+```bash
+uv add arq
+```
+
+### Worker file
+
+```python app/workers/arq_worker.py
+"""Standalone Arq worker. Run with: arq app.workers.arq_worker.WorkerSettings"""
+import logging
+from uuid import UUID
+
+from arq.connections import RedisSettings
+
+from app.config import settings
+from app.database import async_session
+from app.repositories import screening_repository as repo
+from app.pipelines.eligibility import run_pipeline
+
+logger = logging.getLogger(__name__)
+
+
+async def eligibility_pipeline(ctx, screening_id: str):
+    sid = UUID(screening_id)
+    async with async_session() as db:
+        screening = await repo.get_by_id(db, sid)
+        if not screening or screening.status != "submitted":
+            return
+        await repo.update_status(db, screening, status="reviewing")
+        await db.commit()
+
+        outcome = await run_pipeline(screening)
+
+        await repo.update_status(
+            db, screening,
+            status="eligible" if outcome.eligible else "ineligible",
+            eligibility_result="eligible" if outcome.eligible else "ineligible",
+            failed_criteria=outcome.failed_criteria,
+        )
+        await db.commit()
+        logger.info("Arq processed screening %s -> %s", sid, outcome.eligible)
+
+
+class WorkerSettings:
+    redis_settings = RedisSettings(host="redis" if "redis" in settings.db_url else "localhost", port=6379)
+    functions = [eligibility_pipeline]
+    max_jobs = 10
+    max_tries = 3
+    retry_jitter = True
+```
+
+### Drainer pivots to Arq
+
+```python app/workers/outbox_drainer.py
+from arq import create_pool
+from arq.connections import RedisSettings
+
+
+async def drain_loop(*, interval_s: float = 1.0):
+    arq_pool = await create_pool(RedisSettings(host="localhost", port=6379))
+    while True:
+        try:
+            async with async_session() as db:
+                events = await outbox.fetch_unpublished(db, limit=100)
+                for event in events:
+                    if event.event_type == "eligibility.requested":
+                        await arq_pool.enqueue_job(
+                            "eligibility_pipeline",
+                            event.payload["screening_id"],
+                        )
+                    await outbox.mark_published(db, event.id)
+                if events:
+                    await db.commit()
+                    logger.info("Drained %d events to Arq", len(events))
+        except Exception:
+            logger.exception("Drainer error")
+        await asyncio.sleep(interval_s)
+```
+
+### Run it
+
+```bash
+# Terminal A: API + drainer
+uv run uvicorn app.main:app --port 8000
+
+# Terminal B: Arq worker
+uv run arq app.workers.arq_worker.WorkerSettings
+```
+
+Submit a screening — see drainer enqueue, Arq worker process. Two separate processes, joined by Redis.
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Production: separate the drainer from the API">
+    For now we run drainer in lifespan. Production: run it as its own process (Kubernetes Deployment, sidecar, etc.). Decoupling helps scale and reliability.
+  </Accordion>
+  <Accordion title="Why Arq over Celery for new projects?">
+    Async-native (matches our codebase). Lighter (no Celery's complexity overhead). Redis-only is fine for most use cases. Celery still wins for very large/complex deployments and ecosystem.
+  </Accordion>
+</AccordionGroup>
+
+## Final reference
+
+<Card title="Architecture" icon="book" href="/reference/architecture">
+  The big-picture summary.
+</Card>

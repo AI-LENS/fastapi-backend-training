@@ -1,0 +1,273 @@
+---
+title: "22b · Contract, load & security tests"
+description: "Three production-essential test layers most teams skip."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~30 lines · **Outcome:** API matches its OpenAPI contract under fuzz testing. Locust catches load regressions. ZAP scan baseline.
+</Tip>
+
+## Concept
+
+Unit + integration tests cover *correctness*. Production needs three more:
+
+<CardGroup cols={3}>
+  <Card title="Contract tests" icon="link">
+    "Does my API match its OpenAPI spec under any input?" Catches breaking changes before consumers do.
+  </Card>
+  <Card title="Load tests" icon="rocket">
+    "What happens at 100 RPS? At 1000?" Catches latency regressions and resource leaks.
+  </Card>
+  <Card title="Security tests" icon="shield">
+    "Are there obvious vulnerabilities?" Catches OWASP Top 10 issues automatically.
+  </Card>
+</CardGroup>
+
+These run **less often than unit tests** — typically nightly or pre-release — but skipping them is what causes "passes CI, breaks in prod".
+
+## Walkthrough
+
+### Part 1 — Contract testing with Schemathesis
+
+Schemathesis reads your OpenAPI spec (FastAPI generates it for free), generates random valid and invalid requests, and verifies the responses match the documented schema.
+
+```bash
+uv add schemathesis
+```
+
+#### A simple test
+
+```python tests/contract/__init__.py
+# empty
+```
+
+```python tests/contract/test_openapi_contract.py
+"""Schemathesis verifies that the live API matches its OpenAPI spec."""
+import schemathesis
+
+# Loads the spec from the running server
+schema = schemathesis.from_uri("http://localhost:8000/openapi.json")
+
+
+@schema.parametrize()
+def test_api_conforms_to_spec(case):
+    response = case.call()
+    case.validate_response(response)
+```
+
+#### Run it
+
+```bash
+# Server must be running
+uv run uvicorn app.main:app --port 8000 &
+
+# Run contract tests
+uv run pytest tests/contract/ -v
+```
+
+Schemathesis hits each documented endpoint with random valid inputs (and some adversarial mutations) and checks responses match the schema. Found a bug? Schemathesis prints the exact `curl` command to reproduce.
+
+### Part 2 — Load testing with Locust
+
+Locust simulates users hitting your API. Real users, realistic flow.
+
+```bash
+uv add locust
+```
+
+```python tests/load/locustfile.py
+"""Simulate coordinator behavior: login, submit, poll status."""
+import json
+import random
+
+from locust import HttpUser, between, task
+
+
+class CoordinatorUser(HttpUser):
+    wait_time = between(1, 3)   # think time between requests
+
+    def on_start(self):
+        """Login once at the start."""
+        response = self.client.post(
+            "/api/v1/auth/login",
+            json={"email": "alice@example.com", "password": "alice"},
+        )
+        self.token = response.json()["access_token"]
+        self.headers = {"Authorization": f"Bearer {self.token}"}
+
+    @task(5)
+    def submit_screening(self):
+        self.client.post(
+            "/api/v1/screenings",
+            headers=self.headers,
+            json={
+                "site_id": "SITE-001",
+                "candidate_initials": "AB",
+                "age": random.randint(18, 75),
+                "sex": random.choice(["M", "F"]),
+                "diagnosis": "Type 2 Diabetes",
+                "medications": ["metformin"],
+                "is_pregnant": False,
+                "has_liver_disease": False,
+                "in_other_trial": False,
+            },
+        )
+
+    @task(2)
+    def list_screenings(self):
+        self.client.get("/api/v1/screenings", headers=self.headers)
+
+    @task(1)
+    def get_one_screening(self):
+        # Best-effort: assume some IDs exist
+        ...
+```
+
+#### Run it
+
+```bash
+uv run locust -f tests/load/locustfile.py --host http://localhost:8000
+# Open http://localhost:8089
+# Set "Number of users" = 100, "Spawn rate" = 10/s
+# Click "Start"
+```
+
+Watch p95 latency climb as load increases. **What you're looking for:**
+- Latency stays bounded (doesn't go to infinity)
+- Error rate stays near zero
+- Throughput plateaus, doesn't degrade
+
+If p95 climbs to 5 seconds at 100 users, you have a scaling bug — usually a missing index, an unbounded query, or DB connection pool exhaustion.
+
+### Part 3 — Security scan with OWASP ZAP
+
+ZAP is the standard open-source web app scanner. Easiest setup: Docker.
+
+```bash docker run command
+docker run -t --rm \
+  -v "$(pwd)/tests/security:/zap/wrk:rw" \
+  --network host \
+  ghcr.io/zaproxy/zaproxy zap-baseline.py \
+  -t http://localhost:8000/openapi.json \
+  -r security-report.html
+```
+
+(Adjust `--network host` for your setup.)
+
+ZAP's *baseline* scan is non-intrusive: only checks for obvious issues (missing headers, info disclosure, weak tokens). The *active* scan probes for SQL injection / XSS / etc. but is more invasive — only run against test environments.
+
+#### What ZAP catches
+
+- Missing security headers (HSTS, CSP, X-Frame-Options)
+- Info leaks (stack traces in responses, server version headers)
+- Weak TLS config (in real deployments)
+- Common injection patterns
+
+#### What ZAP doesn't catch
+
+- Object-level authorization (Module 17b — needs Bola tests, beyond ZAP)
+- Business-logic flaws ("can a user vote twice?")
+- Rate-limit absence (unless configured)
+
+ZAP is one layer. Pair with manual review and the patterns from Modules 17/17b.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why is contract testing different from integration testing?">
+    Integration tests check **specific scenarios**. Contract tests check **the entire API surface against its spec, with random inputs**. They find: 422 responses with the wrong shape, optional fields actually being required, undocumented status codes.
+  </Accordion>
+  <Accordion title="When do I run load tests?">
+    Pre-release, weekly in CI, or after architectural changes. Not on every commit (too slow). Run a smoke load test (10 users, 1 minute) on every PR; full load test nightly.
+  </Accordion>
+  <Accordion title="ZAP found something — should I fix it immediately?">
+    Triage first. Some findings (e.g., missing CSP) are real but low priority. Some (info leak, missing auth) are critical. Maintain a list of accepted findings (with reasons) so each scan is comparable.
+  </Accordion>
+  <Accordion title="What about dependency vulnerabilities (CVEs)?">
+    Different concern. Use `pip-audit` (run via `uvx pip-audit`) or `safety check` in CI to scan your `pyproject.toml` / `uv.lock` for known CVEs. Module 26b (CI/CD) wires this into the pipeline.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Contract test">
+    ```bash
+    # API must be running
+    uv run pytest tests/contract/ -v
+    ```
+    First runs are slow (Schemathesis explores). Iterate over the issues it surfaces.
+  </Step>
+  <Step title="Smoke load test">
+    ```bash
+    uv run locust -f tests/load/locustfile.py --headless -u 10 -r 2 -t 30s --host http://localhost:8000
+    ```
+    Headless mode runs 10 users for 30 seconds. Stats print at end.
+  </Step>
+  <Step title="ZAP baseline (if Docker installed)">
+    See command above. Open `security-report.html` to review.
+  </Step>
+  <Step title="`pip-audit` for CVEs">
+    ```bash
+    uvx pip-audit
+    ```
+    `uvx` runs `pip-audit` in a temp venv — no project-level install needed. Lists installed packages with known vulnerabilities.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Schemathesis is failing on every endpoint — why?">
+    Common: requires auth and Schemathesis hits unauthenticated. Configure auth header globally:
+    ```python
+    schema = schemathesis.from_uri("...").with_security_parameters(
+        Authorization="Bearer ..."
+    )
+    ```
+  </Accordion>
+  <Accordion title="Locust shows 50% errors at 100 users">
+    Likely: rate limiting (Module 19) kicked in, or DB pool exhausted. Either disable rate limit for load testing (separate config), or scale the limit appropriately.
+  </Accordion>
+  <Accordion title="Should I run tests against production?">
+    Load tests against production, sometimes. **Security tests against production: never** unless explicitly authorized. Active scans can degrade service or trip security alarms.
+  </Accordion>
+  <Accordion title="What's an SLO and how does it relate?">
+    Service Level Objective — a number you commit to ("p99 < 500ms"). Load tests validate you can meet your SLO. If load tests show p99 = 3s, your SLO is unrealistic *or* you have work to do. Module 26c covers SLOs.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add an **authenticated load scenario** to `locustfile.py`: a `SponsorUser` class that logs in as admin and calls `GET /api/v1/admin/jobs?status=dead_letter`.
+
+    1. New `class SponsorUser(HttpUser)` with weight=1 (less often than coordinator's 5/2/1 tasks).
+    2. Run the load test and confirm both user types are simulated.
+
+    `weight` controls relative spawn rate when multiple `HttpUser` classes are present.
+  </Tab>
+  <Tab title="Hint">
+    Locust supports multiple user classes. Each gets its own `on_start`. The auth flow is the same as `CoordinatorUser` — just different credentials.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/22b-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **The three test layers in this module catch different bugs.** Unit tests catch logic errors. Integration tests catch wiring errors. Contract tests catch contract drift. Load tests catch resource leaks. Security scans catch obvious holes. **Skipping any one is a class of bug you'll hit in prod and not in CI.** Production-grade means accepting all five layers as table stakes.
+</Tip>
+
+## Real-world reference
+
+The AnnotateHub team has REQ TEST-02 — a CI gate that fails any test invoking the pipeline without `test_mode=true` (cost control on LLM calls). That's the same idea as the patterns here: failing CI gates catch problems automatically.
+
+## Next module
+
+<Card title="Module 23: Integration tests" icon="link" href="/modules/23-integration-tests">
+  TestClient, dependency overrides, test database fixtures.
+</Card>

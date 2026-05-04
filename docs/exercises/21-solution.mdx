@@ -1,0 +1,61 @@
+---
+title: "21 · Solution"
+description: "Worker queue size gauge."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/workers/task_runner.py
+from app.core.metrics import worker_queue_size
+
+
+class BackgroundTaskRunner:
+    def submit(self, key: UUID, coro_factory) -> None:
+        if key in self._tasks and not self._tasks[key].done():
+            return
+
+        async def runner():
+            async with self._semaphore:
+                try:
+                    await coro_factory()
+                finally:
+                    worker_queue_size.set(len([t for t in self._tasks.values() if not t.done()]))
+
+        self._tasks[key] = asyncio.create_task(runner())
+        worker_queue_size.set(len([t for t in self._tasks.values() if not t.done()]))
+```
+
+## Verify
+
+```bash
+# Submit several quickly
+for i in {1..10}; do
+  curl -sX POST http://localhost:8000/api/v1/screenings \
+    -H "Authorization: Bearer $ALICE" -H "Content-Type: application/json" \
+    -d '{"site_id":"SITE-001","candidate_initials":"AA","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["m"]}' &
+done
+wait
+
+# Observe queue size
+curl -s http://localhost:8000/metrics | grep worker_queue_size
+# enrollment_worker_queue_size 7.0    (or whatever's currently in flight)
+
+# Wait for them to complete, observe drop
+sleep 5
+curl -s http://localhost:8000/metrics | grep worker_queue_size
+# enrollment_worker_queue_size 0.0
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why filter `not t.done()`?">
+    `self._tasks` keeps a reference forever (so we can cancel). The gauge tracks "in flight" — we exclude completed ones. In a real system you'd also clean up `self._tasks` periodically.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 22: Unit tests" icon="puzzle-piece" href="/modules/22-unit-tests" />

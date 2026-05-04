@@ -1,0 +1,60 @@
+---
+title: "16 · Solution"
+description: "Token refresh endpoint."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Solution
+
+```python app/schemas/auth.py
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class AccessTokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+```
+
+```python app/services/auth_service.py
+async def refresh(db: AsyncSession, refresh_token: str) -> str:
+    payload = decode_token(refresh_token)
+    if payload.get("type") != "refresh":
+        raise InvalidCredentials("Wrong token type")
+    user = await user_repo.get_by_id(db, payload["sub"])
+    if user is None or not user.is_active:
+        raise InvalidCredentials("User not found or disabled")
+    return issue_access_token(user)
+```
+
+```python app/routers/auth.py
+@router.post("/refresh", response_model=AccessTokenOut)
+async def refresh(payload: RefreshRequest, db: AsyncSession = Depends(get_db_session)):
+    access = await auth_service.refresh(db, payload.refresh_token)
+    return AccessTokenOut(access_token=access)
+```
+
+## Try it
+
+```bash
+REFRESH=$(curl -sX POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"admin"}' | jq -r .refresh_token)
+
+curl -X POST http://localhost:8000/api/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{\"refresh_token\": \"$REFRESH\"}" | jq
+```
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Should refresh issue a new refresh token too (token rotation)?">
+    Yes, in higher-security setups. Each refresh issues a *new* refresh token and invalidates the old one (server-side blocklist). Detects refresh-token theft within one round-trip. We left it simple here.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 17: RBAC" icon="key" href="/modules/17-rbac" />

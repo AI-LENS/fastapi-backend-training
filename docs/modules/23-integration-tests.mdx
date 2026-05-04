@@ -1,0 +1,370 @@
+---
+title: "23 · Integration tests"
+description: "TestClient, async client, dependency overrides, test database fixtures."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~40 lines · **Outcome:** End-to-end tests of the screening flow against a real (in-memory) DB. Tests run in seconds.
+</Tip>
+
+## Concept
+
+Unit tests prove pieces work. **Integration tests prove they work together.** They start the FastAPI app, hit real endpoints, with a real DB — but everything is in-memory and isolated per test.
+
+### Three things that make integration tests fast and isolated
+
+<CardGroup cols={3}>
+  <Card title="In-memory SQLite" icon="database">
+    `sqlite+aiosqlite:///:memory:` — fresh DB per test, milliseconds to set up.
+  </Card>
+  <Card title="Dependency overrides" icon="key">
+    `app.dependency_overrides[get_db_session] = ...` — swap real for fake.
+  </Card>
+  <Card title="App factory" icon="rocket">
+    `create_app()` returns a fresh app per test — no global state pollution.
+  </Card>
+</CardGroup>
+
+## Walkthrough
+
+### Step 1 — pytest fixtures
+
+```python tests/integration/__init__.py
+# empty
+```
+
+```python tests/integration/conftest.py
+"""Shared fixtures for integration tests.
+
+Each test gets:
+  - A fresh in-memory SQLite DB
+  - A fresh FastAPI app
+  - An async HTTP client
+  - Pre-seeded test users and sites
+"""
+from typing import AsyncIterator
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.dependencies import get_db_session, get_uow
+from app.db.unit_of_work import UnitOfWork
+from app.main import create_app
+from app.models.base import Base
+import app.models.screening      # noqa: F401
+import app.models.site           # noqa: F401
+import app.models.user           # noqa: F401
+import app.models.audit_log      # noqa: F401
+import app.models.job_record     # noqa: F401
+from app.models.site import Site
+from app.models.user import User
+from app.repositories import site_repository, user_repository
+from app.services.auth_service import hash_password   # the helper you wrote in Module 16
+
+
+@pytest_asyncio.fixture
+async def engine():
+    """Fresh in-memory engine per test."""
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with eng.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield eng
+    await eng.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory(engine):
+    return async_sessionmaker(engine, expire_on_commit=False)
+
+
+@pytest_asyncio.fixture
+async def seeded(session_factory) -> dict:
+    """Insert default users and sites; return their references."""
+    async with session_factory() as db:
+        # Inline insert — no `seed` helper on `site_repository` exists.
+        db.add_all([
+            Site(id="SITE-001", name="Site 001", active=True),
+            Site(id="SITE-002", name="Site 002", active=True),
+        ])
+        await db.flush()
+        sponsor = User(
+            email="admin@test.com", hashed_password=hash_password("pwd"),
+            full_name="Admin", role="sponsor",
+        )
+        alice = User(
+            email="alice@test.com", hashed_password=hash_password("pwd"),
+            full_name="Alice", role="coordinator", site_id="SITE-001",
+        )
+        bob = User(
+            email="bob@test.com", hashed_password=hash_password("pwd"),
+            full_name="Bob", role="coordinator", site_id="SITE-002",
+        )
+        for u in [sponsor, alice, bob]:
+            db.add(u)
+        await db.commit()
+        return {"sponsor": sponsor, "alice": alice, "bob": bob}
+
+
+@pytest_asyncio.fixture
+async def app(session_factory, seeded):
+    """Fresh app with deps overridden to use the test session factory."""
+    test_app = create_app()
+
+    async def _override_db():
+        async with session_factory() as session:
+            yield session
+
+    def _override_uow():
+        return UnitOfWork(session_factory)
+
+    test_app.dependency_overrides[get_db_session] = _override_db
+    test_app.dependency_overrides[get_uow] = _override_uow
+
+    yield test_app
+
+    test_app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def client(app) -> AsyncIterator[AsyncClient]:
+    """Async HTTP client bound to the test app."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as c:
+        yield c
+
+
+@pytest_asyncio.fixture
+async def alice_token(client) -> str:
+    r = await client.post("/api/v1/auth/login", json={"email": "alice@test.com", "password": "pwd"})
+    return r.json()["access_token"]
+
+
+@pytest_asyncio.fixture
+async def alice_auth(alice_token):
+    return {"Authorization": f"Bearer {alice_token}"}
+
+
+@pytest_asyncio.fixture
+async def admin_token(client) -> str:
+    r = await client.post("/api/v1/auth/login", json={"email": "admin@test.com", "password": "pwd"})
+    return r.json()["access_token"]
+
+
+@pytest_asyncio.fixture
+async def admin_auth(admin_token):
+    return {"Authorization": f"Bearer {admin_token}"}
+```
+
+### Step 2 — Tests that use the fixtures
+
+```python tests/integration/test_screenings.py
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_login_returns_tokens(client):
+    r = await client.post("/api/v1/auth/login", json={"email": "alice@test.com", "password": "pwd"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "access_token" in body
+    assert "refresh_token" in body
+
+
+@pytest.mark.asyncio
+async def test_anonymous_cannot_list_screenings(client):
+    r = await client.get("/api/v1/screenings")
+    assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_alice_can_submit_for_her_site(client, alice_auth):
+    r = await client.post(
+        "/api/v1/screenings",
+        headers=alice_auth,
+        json={
+            "site_id": "SITE-001",
+            "candidate_initials": "AA",
+            "age": 40, "sex": "F",
+            "diagnosis": "Type 2 Diabetes",
+            "medications": ["metformin"],
+            "is_pregnant": False, "has_liver_disease": False, "in_other_trial": False,
+        },
+    )
+    assert r.status_code == 201, r.text
+
+
+@pytest.mark.asyncio
+async def test_alice_cannot_submit_for_another_site(client, alice_auth):
+    r = await client.post(
+        "/api/v1/screenings",
+        headers=alice_auth,
+        json={
+            "site_id": "SITE-002",
+            "candidate_initials": "AA",
+            "age": 40, "sex": "F",
+            "diagnosis": "Type 2 Diabetes",
+            "medications": ["metformin"],
+            "is_pregnant": False, "has_liver_disease": False, "in_other_trial": False,
+        },
+    )
+    assert r.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_object_level_isolation(client, alice_auth):
+    """Bob's screenings should be invisible to Alice."""
+    bob_token = (await client.post("/api/v1/auth/login", json={"email": "bob@test.com", "password": "pwd"})).json()["access_token"]
+    bob_auth = {"Authorization": f"Bearer {bob_token}"}
+
+    bob_screening = await client.post(
+        "/api/v1/screenings", headers=bob_auth,
+        json={
+            "site_id": "SITE-002", "candidate_initials": "BB",
+            "age": 40, "sex": "F", "diagnosis": "Type 2 Diabetes",
+            "medications": ["m"], "is_pregnant": False,
+            "has_liver_disease": False, "in_other_trial": False,
+        },
+    )
+    sid = bob_screening.json()["id"]
+
+    # Alice tries to read Bob's screening
+    r = await client.get(f"/api/v1/screenings/{sid}", headers=alice_auth)
+    assert r.status_code == 404   # 404 not 403 — no info leak
+
+
+@pytest.mark.asyncio
+async def test_admin_endpoint_requires_sponsor(client, alice_auth, admin_auth):
+    """Coordinator forbidden, sponsor allowed."""
+    r1 = await client.get("/api/v1/admin/jobs", headers=alice_auth)
+    assert r1.status_code == 403
+
+    r2 = await client.get("/api/v1/admin/jobs", headers=admin_auth)
+    assert r2.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_validation_error_envelope(client, alice_auth):
+    r = await client.post(
+        "/api/v1/screenings", headers=alice_auth,
+        json={"site_id": "SITE-001"},   # missing required fields
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_404_for_unknown_screening(client, alice_auth):
+    r = await client.get(
+        "/api/v1/screenings/00000000-0000-0000-0000-000000000000",
+        headers=alice_auth,
+    )
+    assert r.status_code == 404
+    body = r.json()
+    assert "error" in body
+    assert body["error"]["code"] == "screening_not_found"
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`AsyncClient(transport=ASGITransport(app=app))`">
+    httpx's way of testing an ASGI app *in-process* — no real socket, no real port. Faster than spawning a server.
+  </Accordion>
+  <Accordion title="`app.dependency_overrides[get_db_session] = ...`">
+    The single most powerful FastAPI testing feature. Swap any dep for a fake. Tests can plug in test DB, fake clock, mock external API — without touching production code.
+  </Accordion>
+  <Accordion title="Why a fresh app per test?">
+    Test isolation. If two tests share an app, `dependency_overrides` from one leaks into the other. Fresh `create_app()` removes that risk.
+  </Accordion>
+  <Accordion title="Why in-memory SQLite?">
+    Real DB (catches SQL bugs unit tests miss), zero setup, milliseconds to spin up. Same SQL semantics as Postgres for ~95% of cases. The remaining 5% (Postgres-specific features) you test in a separate suite.
+  </Accordion>
+  <Accordion title="Where do background workers fit in?">
+    Disable them in tests by overriding `get_task_runner` with a no-op:
+    ```python
+    from app.dependencies import get_task_runner
+
+    class NoopTaskRunner:
+        def submit(self, key, coro_factory): pass
+        async def shutdown(self, timeout=0): pass
+
+    test_app.dependency_overrides[get_task_runner] = lambda: NoopTaskRunner()
+    ```
+    Most integration tests verify the *synchronous* path. Worker behavior is tested separately (Module 22 unit tests + a few targeted integration tests).
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Run all integration tests">
+    ```bash
+    pytest tests/integration/ -v
+    ```
+    All green in seconds.
+  </Step>
+  <Step title="Run with coverage">
+    ```bash
+    pytest tests/integration/ --cov=app --cov-report=term-missing
+    ```
+    Should hit 70-80% on routes/services combined with the unit tests from Module 22.
+  </Step>
+  <Step title="Watch a single failure">
+    Break something deliberately (change `screening_not_found` → `not_screening`) and rerun the test. Read the assertion error.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I commit my test DB?">
+    No. The in-memory engine creates a fresh DB per test. The `enrollment.db` from dev should be gitignored already.
+  </Accordion>
+  <Accordion title="What about the worker — does it run during tests?">
+    Yes by default; `BackgroundTaskRunner.submit` schedules tasks. For deterministic tests, override the runner with a noop or one that runs synchronously inline. See the box above.
+  </Accordion>
+  <Accordion title="`pytest-asyncio` warnings about deprecation">
+    Set `asyncio_mode = "auto"` in pyproject. That covers most warnings. Pin to a recent version (>= 0.23).
+  </Accordion>
+  <Accordion title="My tests pollute each other — what's wrong?">
+    Likely the engine fixture isn't function-scoped. Confirm `@pytest_asyncio.fixture` (default scope = function). For session-scoped fixtures (faster), use only for setup that doesn't include data.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Write **two more integration tests**:
+
+    1. `test_full_screening_flow` — submit, wait briefly, fetch back, assert status changed (it'll be `eligible` if you submit a valid one). Use `await asyncio.sleep(0.5)` to let the worker run.
+    2. `test_audit_log_records_submission` — submit a screening, then login as admin and `GET /admin/audit?action=screening.submitted`, assert the entry exists with the right `resource_id`.
+
+    Run with `pytest tests/integration/ -v -k "full_flow or audit"`.
+  </Tab>
+  <Tab title="Hint">
+    For test 1, after submitting, poll the GET endpoint a few times. For test 2, the audit query returns a list — assert at least one entry has `resource_id` matching the submitted screening's ID.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/23-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **Integration tests are where your architecture pays its biggest dividend.** Layered code with DI is straightforward to integration-test; tangled code with hardcoded singletons is impossible. Every dependency override in this module exists because someone — long ago — chose to use `Depends()` instead of a global. That's the architectural payoff compounding.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/tests/conftest.py` — production fixtures. Same patterns: in-memory DB, dep overrides, factory functions for test data.
+
+## Next module
+
+<Card title="Module 24: Config & secrets" icon="key" href="/modules/24-config-secrets">
+  Environment-based config, secret handling, 12-factor compliance.
+</Card>

@@ -1,0 +1,325 @@
+---
+title: "26b · CI/CD"
+description: "GitHub Actions pipeline: lint → test → build → migrate → deploy."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~50 lines (YAML) · **Outcome:** A working CI pipeline that runs on every PR.
+</Tip>
+
+## Concept
+
+CI/CD = **Continuous Integration** + **Continuous Deployment**.
+
+- **CI**: every push runs tests, lints, security scans. Fails fast; humans never wait on each other for "did it pass".
+- **CD**: merges to `main` automatically deploy to staging (or production with manual approval).
+
+Together: code change → automatic confidence → production. With **quality gates** at every step.
+
+### A good CI pipeline
+
+```
+┌──────────────────────────────────────┐
+│  On push / PR                         │
+│                                       │
+│  1. Lint (ruff, mypy)                 │
+│  2. Unit tests (fast)                 │
+│  3. Integration tests (medium)        │
+│  4. Build Docker image                │
+│  5. Run image: migrations + smoke test│
+│  6. Security scan (CVEs, ZAP baseline)│
+│  7. Push image to registry            │
+│  8. Deploy to staging                  │
+│  9. Smoke tests against staging        │
+│  10. (Manual) deploy to production    │
+└──────────────────────────────────────┘
+```
+
+Failing any step blocks the merge / deploy. Quality is **enforced**, not "encouraged".
+
+## Walkthrough
+
+We'll use **GitHub Actions** — the same patterns work in GitLab CI, CircleCI, Jenkins.
+
+### Step 1 — Lint config
+
+```toml pyproject.toml
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "B", "S"]   # Errors, pyFlakes, Imports, Naming, Bugs, Security
+ignore = ["S101"]   # allow assert (we use it in tests)
+
+[tool.mypy]
+python_version = "3.12"
+strict = false   # gradual; tighten over time
+ignore_missing_imports = true
+```
+
+### Step 2 — The CI workflow
+
+```yaml .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups   # installs the dev group declared in pyproject.toml
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  test-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups   # installs the dev group declared in pyproject.toml
+      - run: uv run pytest tests/unit/ -v --cov=app --cov-report=xml
+      - uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+
+  test-integration:
+    runs-on: ubuntu-latest
+    needs: test-unit
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: enrollment
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: enrollment
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U enrollment" --health-interval 10s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups   # installs the dev group declared in pyproject.toml
+      # Module 23's conftest hardcodes sqlite+aiosqlite — update it to honour
+      # `ENROLLMENT_DB_URL` if you actually want to test against the Postgres
+      # service above. Otherwise, drop the `services.postgres` block; CI will
+      # exercise the SQLite path the same way local tests do.
+      - run: uv run pytest tests/integration/ -v
+        env:
+          ENROLLMENT_DB_URL: postgresql+asyncpg://enrollment:ci@localhost:5432/enrollment
+          ENROLLMENT_SECRET_KEY: ci-test-secret-32-bytes-long-aaaa
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uvx pip-audit
+        # `uvx` runs a tool in a temporary, isolated venv — perfect for one-off scans
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, test-unit, test-integration, security]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: .
+          tags: enrollment:${{ github.sha }}
+          load: true   # load into local docker for the smoke step
+      - name: Smoke test the image
+        run: |
+          docker run --rm -d --name smoke -p 8000:8000 \
+            -e ENROLLMENT_SECRET_KEY=ci-test-secret-32-bytes-long-aaaa \
+            -e ENROLLMENT_DB_URL=sqlite+aiosqlite:///:memory: \
+            enrollment:${{ github.sha }}
+          for i in {1..30}; do
+            if curl -sf http://localhost:8000/health/live; then
+              echo "App started"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs smoke
+          exit 1
+      - name: Push image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # docker login + docker push to your registry
+          echo "Would push to registry here"
+```
+
+### Step 3 — Branch protection rule
+
+In GitHub repo settings → Branches → Add rule for `main`:
+- Require status checks: lint, test-unit, test-integration, security, build
+- Require branches to be up to date before merging
+- Require pull request reviews
+
+Now no one can merge to main without all checks passing.
+
+### Step 4 — Deploy to staging on main merge
+
+```yaml .github/workflows/deploy-staging.yml
+name: Deploy staging
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      # Deploy step depends on your platform:
+      # - kubectl apply (Kubernetes)
+      # - aws ecs update-service (AWS)
+      # - flyctl deploy (Fly.io)
+      # - railway up (Railway)
+      - name: Deploy
+        run: echo "(deploy command for your platform)"
+      - name: Smoke test staging
+        run: |
+          for i in {1..60}; do
+            if curl -sf https://staging.example.com/health/ready; then
+              echo "Staging is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
+```
+
+### Step 5 — Production deploy with approval
+
+```yaml .github/workflows/deploy-production.yml
+name: Deploy production
+
+on:
+  workflow_dispatch:   # manual trigger only
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://app.example.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy
+        run: echo "(production deploy command)"
+```
+
+The `environment: production` setting in GitHub adds approval gates — designated reviewers must approve before deploys proceed.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="Why split lint, test-unit, test-integration into separate jobs?">
+    Parallelism. They run concurrently; failure in one doesn't block the others. Faster feedback. Tradeoff: shared setup is repeated. Worth it for fast jobs.
+  </Accordion>
+  <Accordion title="`astral-sh/setup-uv` with `enable-cache: true`">
+    Caches uv's package cache *and* the resolved venv between runs. First run installs full deps; subsequent runs hit the cache. uv is so fast that even a cold install takes seconds. (If you ever switch to a pip-based project, the equivalent is `actions/setup-python@v5` with `cache: pip`.)
+  </Accordion>
+  <Accordion title="`uvx pip-audit` in security job">
+    Scans installed deps (resolved from `uv.lock`) for known CVEs. New CVEs fail CI — you upgrade or pin around them. Run weekly even without code changes (a CVE could be discovered in a frozen dep). `uvx` runs the tool in an isolated temporary venv.
+  </Accordion>
+  <Accordion title="What about secrets in CI?">
+    GitHub Secrets (or GitLab Variables, etc.). Set them in the repo settings; reference as `${{ secrets.NAME }}` in YAML. Never echo them; never log them; rotate after exposure.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Push a commit, watch CI run">
+    On a branch, push. Open the GitHub Actions tab. Each job should run; failing tests/lints make red. Iterate until green.
+  </Step>
+  <Step title="Run lint locally">
+    ```bash
+    uv add --group dev ruff
+    uv run ruff check .
+    uv run ruff format --check .
+    ```
+    Same as CI.
+  </Step>
+  <Step title="Test the smoke pattern locally">
+    ```bash
+    docker run --rm -d --name smoke -p 8000:8000 \
+      -e ENROLLMENT_SECRET_KEY=local-test-secret-32-bytes-long-x \
+      -e ENROLLMENT_DB_URL=sqlite+aiosqlite:///:memory: \
+      enrollment:latest
+
+    sleep 3
+    curl http://localhost:8000/health/live
+    docker stop smoke
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="What's the right test ordering — fast first or slow first?">
+    **Fast first.** Lint, unit tests catch most issues in 30 seconds. Integration tests in 2 minutes. Smoke test in 5 minutes. Fail-fast on cheap checks before paying for the expensive ones.
+  </Accordion>
+  <Accordion title="When should I deploy on every commit vs require manual?">
+    Staging: every commit (auto). Production: depends on team risk tolerance — auto with strong test coverage and feature flags, or manual with approval. Many teams do both: auto-deploy to a small percentage (canary), then manual promotion.
+  </Accordion>
+  <Accordion title="What's a 'green build' policy?">
+    Every commit on main passes all checks. If main is broken, *no one merges* until it's fixed. Violations cause cascading misery. Worth enforcing.
+  </Accordion>
+  <Accordion title="What about migrations in CI?">
+    The integration tests run them implicitly (the test DB applies them). Production deploys run `alembic upgrade head` as a deploy step before the new app version starts.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a **Schemathesis contract test job** to the CI workflow.
+
+    1. New job `contract` that depends on `build`.
+    2. It runs the built Docker image, then runs `schemathesis run --checks all http://localhost:8000/openapi.json` against it.
+    3. Failures fail the job.
+
+    This catches contract drift on every PR.
+  </Tab>
+  <Tab title="Hint">
+    Use a `service` block to run the API in CI (similar to how `test-integration` runs Postgres). Then `uv add --group dev schemathesis` (or `uvx schemathesis`) and run it.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/26b-solution)
+  </Tab>
+</Tabs>
+
+## Insight
+
+<Tip>
+  **CI/CD is the multiplier on every other pattern in this curriculum.** Tests catch bugs *only when you run them*. Migrations are safe *only when applied*. Type checks help *only when enforced*. CI is the discipline that makes "we test things" go from a wish to a guarantee. Without it, every other practice is on the honor system.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/.github/workflows/` — production CI for the AnnotateHub project. Notice the test_mode CI gate (REQ TEST-02) — a custom check that fails any test invoking the LLM pipeline without `test_mode=true` (cost control).
+
+## Next module
+
+<Card title="Module 26c: Monitoring & alerting" icon="chart-bar" href="/modules/26c-monitoring-alerting">
+  Alert when things go wrong — golden signals, SLOs, and runbooks.
+</Card>

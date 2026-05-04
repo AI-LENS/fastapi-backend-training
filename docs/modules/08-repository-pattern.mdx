@@ -1,0 +1,297 @@
+---
+title: "08 · Repository pattern"
+description: "Isolate database access. Routes and services should never touch the ORM directly."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~15 lines · **Outcome:** All SQL lives in `app/repositories/`. Routes shrink dramatically.
+</Tip>
+
+## Concept
+
+Right now your routes read like:
+
+```python
+stmt = select(Screening).where(Screening.site_id == site_id)
+result = await db.execute(stmt)
+return result.scalars().all()
+```
+
+That's SQL. SQL doesn't belong in route handlers — it belongs in **repositories**.
+
+```
+Route ──► Repository ──► Database
+       (intent)      (queries)
+```
+
+Then your route reads:
+
+```python
+return await screening_repo.list_by_site(db, site_id)
+```
+
+### Why this matters
+
+<CardGroup cols={3}>
+  <Card title="Testable" icon="puzzle-piece">
+    Swap real repo for a fake in tests. No DB needed for service tests.
+  </Card>
+  <Card title="DRY" icon="link">
+    Same query reused from 3 routes. Write once, fix once.
+  </Card>
+  <Card title="Readable" icon="book">
+    `list_by_site_and_status(...)` is intent. `select(...).where(...).where(...)` is mechanism.
+  </Card>
+</CardGroup>
+
+### Function-based vs class-based
+
+Two valid styles:
+
+| Style | When |
+|---|---|
+| **Functions** in a module | Smaller codebases, no shared state needed, easier to grep. Used by AnnotateHub. |
+| **Classes** with methods | If the repo holds state (e.g., a tenant filter set at construction). |
+
+We use **functions** — simpler, easier to follow.
+
+## Walkthrough
+
+### Step 1 — Create the screening repository
+
+```python app/repositories/__init__.py
+# empty
+```
+
+```python app/repositories/screening_repository.py
+"""Database access for the Screening resource. The ONLY place we write SQL for screenings."""
+from datetime import datetime, timezone
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.screening import Screening
+
+
+async def create(db: AsyncSession, **fields) -> Screening:
+    """Insert a new screening and return the persisted instance."""
+    screening = Screening(**fields)
+    db.add(screening)
+    await db.commit()
+    await db.refresh(screening)
+    return screening
+
+
+async def get_by_id(db: AsyncSession, screening_id: UUID) -> Screening | None:
+    return await db.get(Screening, screening_id)
+
+
+async def list_filtered(
+    db: AsyncSession,
+    *,
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[Screening]:
+    stmt = select(Screening).order_by(Screening.created_at.desc()).limit(limit)
+    if site_id is not None:
+        stmt = stmt.where(Screening.site_id == site_id)
+    if status is not None:
+        stmt = stmt.where(Screening.status == status)
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def update_status(
+    db: AsyncSession,
+    screening: Screening,
+    *,
+    status: str,
+    eligibility_result: str | None = None,
+    failed_criteria: list[str] | None = None,
+) -> Screening:
+    screening.status = status
+    if eligibility_result is not None:
+        screening.eligibility_result = eligibility_result
+    if failed_criteria is not None:
+        screening.failed_criteria = failed_criteria
+    await db.commit()
+    await db.refresh(screening)
+    return screening
+
+
+async def mark_enrolled(
+    db: AsyncSession,
+    screening: Screening,
+    *,
+    subject_id: str,
+) -> Screening:
+    screening.status = "enrolled"
+    screening.subject_id = subject_id
+    # `enrolled_at` was added in the Module 07 exercise; if you skipped it,
+    # delete this line and add the column when you tackle that exercise.
+    screening.enrolled_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(screening)
+    return screening
+
+
+async def delete(db: AsyncSession, screening: Screening) -> None:
+    await db.delete(screening)
+    await db.commit()
+```
+
+### Step 2 — Refactor the router to use it
+
+```python app/routers/screenings.py
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.database import get_db
+from app.repositories import screening_repository as repo
+from app.schemas.screening import ScreeningCreate, ScreeningResponse
+
+router = APIRouter(prefix="/screenings", tags=["screenings"])
+
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+async def create_screening(payload: ScreeningCreate, db: AsyncSession = Depends(get_db)):
+    return await repo.create(db, **payload.model_dump())
+
+
+@router.get("", response_model=list[ScreeningResponse])
+async def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    # `default_list_limit` was added in the Module 04 exercise. If you skipped
+    # that exercise, hardcode `limit: int = 50` here for now.
+    limit: int = settings.default_list_limit,
+    db: AsyncSession = Depends(get_db),
+):
+    return await repo.list_filtered(db, site_id=site_id, status=status, limit=limit)
+
+
+@router.get("/{screening_id}", response_model=ScreeningResponse)
+async def get_screening(screening_id: UUID, db: AsyncSession = Depends(get_db)):
+    screening = await repo.get_by_id(db, screening_id)
+    if screening is None:
+        raise HTTPException(404, detail="Screening not found")
+    return screening
+
+
+@router.delete("/{screening_id}", status_code=204)
+async def delete_screening(screening_id: UUID, db: AsyncSession = Depends(get_db)):
+    screening = await repo.get_by_id(db, screening_id)
+    if screening is None:
+        raise HTTPException(404, detail="Screening not found")
+    if screening.status != "submitted":
+        raise HTTPException(409, detail=f"Cannot delete screening in status {screening.status}")
+    await repo.delete(db, screening)
+```
+
+Notice how short the router is now. Every line is intent.
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`*,` in function signatures">
+    Forces the following arguments to be passed by keyword: `repo.list_filtered(db, site_id="X")`, never `repo.list_filtered(db, "X")`. Makes call sites self-documenting and prevents bugs from positional arg drift.
+  </Accordion>
+  <Accordion title="`from app.repositories import screening_repository as repo`">
+    The `as repo` alias keeps call sites short (`repo.create(...)` not `screening_repository.create(...)`) without sacrificing namespacing.
+  </Accordion>
+  <Accordion title="Why does `update_status` take the screening object, not the ID?">
+    Because most callers already have the object (they fetched it to validate something). Passing the object skips a redundant `get_by_id` query. If a caller only has the ID, they call `get_by_id` first.
+  </Accordion>
+  <Accordion title="What if I want a transaction across multiple repo calls?">
+    Pass the same `db` session and don't commit until the end. The first `db.commit()` finalizes the transaction; subsequent calls in the same session continue with a new transaction. Module 09 covers explicit transaction boundaries.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart">
+    All your existing endpoints should still work — same external behavior, cleaner internals.
+  </Step>
+  <Step title="grep for SQL outside repos">
+    ```bash
+    grep -rn "select(" app/routers/
+    ```
+    Expect: zero results. (`select` from SQLAlchemy is gone from routers.)
+  </Step>
+  <Step title="Verify the router is shorter">
+    ```bash
+    wc -l app/routers/screenings.py
+    ```
+    ~30 lines vs ~50 before.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should the repo raise exceptions, or return None?">
+    **Return None for not-found.** Raising couples the repo to HTTP concerns. The route or service decides what 404 means. The repo's job is *"is it there or not"*, not *"how should the caller react"*.
+  </Accordion>
+  <Accordion title="Where do I do business validation — in the repo or service?">
+    Service. Repos answer "is this data here?" Services answer "should we do this?" — `screening.status != "submitted"` is a business rule and we'll move it to the service in Module 09.
+  </Accordion>
+  <Accordion title="Should I write a test for the repository?">
+    Yes — Module 22. Repo tests use a real (in-memory) SQLite. They run in milliseconds and catch SQL bugs that mocks would never find.
+  </Accordion>
+  <Accordion title="What about complex queries with joins?">
+    Same place — the repository. If a join joins two domains (e.g., `Screening` and `User`), put it in the repo whose primary entity is being queried.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Create a `site_repository.py` with these functions:
+    - `list_all(db, *, active: bool | None = None)` — returns all sites, optionally filtered
+    - `get_by_id(db, site_id: str)` — returns the site or None
+    - `seed(db, sites: list[Site])` — inserts the list if the table is empty (used by lifespan)
+
+    Then refactor `app/routers/sites.py` to use the repo (no more `select(Site)` in the router) and update the lifespan in `main.py` to call `site_repository.seed(...)`.
+
+    You'll write ~25 lines.
+  </Tab>
+  <Tab title="Hint">
+    Pattern from `screening_repository.py` directly applies. The `seed` function checks emptiness with `result.scalars().first() is None`, then `add_all` + `commit`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/08-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+grep -rn "select(" app/routers/
+# Should show nothing — zero SQL in routers
+grep -rn "select(" app/main.py
+# Same — main is clean
+wc -l app/repositories/*.py
+# Each repo file is small (~30-60 lines)
+```
+
+## Insight
+
+<Tip>
+  **A good repo file reads like a domain glossary.** `create`, `get_by_id`, `list_filtered`, `update_status`, `mark_enrolled`. Each name is intent — a junior on the team can read this file and understand what operations exist on a Screening, without knowing SQL. That's the value.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/repositories/job_repository.py` — 78 lines of pure data access. Notice it doesn't import anything from `routers/` or `services/` — repos are at the bottom of the dependency graph.
+
+## Next module
+
+<Card title="Module 09: Service layer" icon="puzzle-piece" href="/modules/09-service-layer">
+  Move business logic out of routes into the service layer. The decision-making layer.
+</Card>

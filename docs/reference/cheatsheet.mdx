@@ -1,0 +1,185 @@
+---
+title: "Cheatsheet"
+description: "Commands and snippets you'll use repeatedly."
+---
+
+## uv daily commands
+
+```bash
+# Install all deps + dev deps from pyproject.toml
+uv sync --group dev
+
+# Add a new runtime dep (also updates pyproject.toml)
+uv add fastapi
+uv add "sqlalchemy[asyncio]>=2.0"
+
+# Add a dev/test dep
+uv add --group dev pytest
+
+# Run any command in the project's venv (no activation needed)
+uv run uvicorn app.main:app --reload --port 8000
+uv run pytest -v
+uv run python -c "import fastapi; print(fastapi.__version__)"
+
+# Re-resolve the lockfile
+uv lock
+
+# Update a single dep
+uv lock --upgrade-package fastapi
+```
+
+## Daily commands
+
+```bash
+# Run the API with hot-reload
+uv run uvicorn app.main:app --reload --port 8000
+
+# Run the docs site
+cd docs && mintlify dev
+
+# Run tests
+uv run pytest -v
+
+# Run a single test
+uv run pytest tests/test_screenings.py::test_create_eligible -v
+
+# Run with coverage
+uv run pytest --cov=app --cov-report=term-missing
+```
+
+## Mintlify components — quick reference
+
+```mdx
+<Note>Important info</Note>
+<Tip>Helpful suggestion</Tip>
+<Warning>Critical warning</Warning>
+
+<Steps>
+  <Step title="Step 1">Content</Step>
+</Steps>
+
+<AccordionGroup>
+  <Accordion title="Click to expand">Content</Accordion>
+</AccordionGroup>
+
+<Tabs>
+  <Tab title="Tab 1">Content</Tab>
+</Tabs>
+
+<CardGroup cols={2}>
+  <Card title="Title" icon="rocket" href="/path">Description</Card>
+</CardGroup>
+```
+
+## Database commands (Module 07+)
+
+```bash
+# Create a new migration after editing models
+uv run alembic revision --autogenerate -m "describe change"
+
+# Apply migrations to the database
+uv run alembic upgrade head
+
+# Roll back the last migration
+uv run alembic downgrade -1
+
+# See current revision
+uv run alembic current
+```
+
+## curl snippets
+
+```bash
+# GET
+curl http://localhost:8000/screenings
+
+# POST with JSON body
+curl -X POST http://localhost:8000/screenings \
+  -H "Content-Type: application/json" \
+  -d '{"age": 42, "diagnosis": "Type 2 Diabetes", ...}'
+
+# With JWT auth (Module 16+)
+curl http://localhost:8000/screenings \
+  -H "Authorization: Bearer <your-jwt-here>"
+
+# Pretty-print JSON output (requires jq)
+curl http://localhost:8000/screenings | jq
+```
+
+## Python snippets you'll repeat
+
+### A FastAPI app
+
+```python
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/")
+def root():
+    return {"ok": True}
+```
+
+### A path/query/body handler
+
+```python
+from pydantic import BaseModel
+
+class Item(BaseModel):
+    name: str
+    qty: int = 1
+
+@app.post("/items/{cat}", status_code=201)
+def create(cat: str, item: Item, source: str | None = None):
+    return {"cat": cat, "item": item, "source": source}
+```
+
+### A yield-based dependency (DB session)
+
+```python
+# from app.database import async_session  ← see Module 05
+async def get_db():
+    async with async_session() as session:
+        yield session
+```
+
+### A dependency-injected route
+
+```python
+from fastapi import Depends
+
+@app.get("/screenings")
+async def list_screenings(db = Depends(get_db)):
+    return await screening_repo.list_all(db)
+```
+
+### Custom exception handler
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+class ScreeningNotFound(Exception): ...
+
+@app.exception_handler(ScreeningNotFound)
+async def handle_not_found(_: Request, exc: ScreeningNotFound):
+    return JSONResponse(status_code=404, content={"error": str(exc)})
+```
+
+## Git habits in this training
+
+```bash
+# After each module, commit your work so you can roll back if needed
+git add .
+git commit -m "module 03: routers and params"
+
+# Before starting a hard module, create a branch
+git checkout -b module-14-pipelines
+```
+
+## When something breaks
+
+1. Read the error from top — Python stack traces are bottom-up but FastAPI ones are usually top-down for the relevant frame
+2. Hit `/docs` — does the route still exist?
+3. `uv run python -c "import fastapi; print(fastapi.__version__)"` — right version?
+4. `uv sync` — re-install everything from `pyproject.toml`
+5. Restart uvicorn (`Ctrl+C` then re-run) — `--reload` occasionally gets confused

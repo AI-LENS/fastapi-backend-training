@@ -1,0 +1,298 @@
+---
+title: "06 · Models"
+description: "Tables, columns, relationships, indexes, timestamps, soft delete."
+---
+
+<Tip>
+  **Time:** 60 min · **Code you'll write:** ~25 lines · **Outcome:** A real `screenings` table backed by SQLite. POST /screenings actually persists.
+</Tip>
+
+## Concept
+
+A **model** is a Python class that maps to a database table.
+
+```
+class Screening(Base):       ↔     CREATE TABLE screenings (
+    id: Mapped[UUID]                  id UUID PRIMARY KEY,
+    age: Mapped[int]                  age INTEGER NOT NULL,
+    ...                               ...
+                                    );
+```
+
+SQLAlchemy 2.0 introduced a typed declarative API (`Mapped[]`, `mapped_column`) — that's what we use.
+
+### Anatomy of a good model
+
+<CardGroup cols={2}>
+  <Card title="Primary key" icon="key">
+    Every table has one. UUID is safer than auto-increment integer (no enumeration attacks).
+  </Card>
+  <Card title="Indexes" icon="chart-bar">
+    On every column you'll filter or sort by. `site_id`, `status`, `created_at` here.
+  </Card>
+  <Card title="Timestamps" icon="clock">
+    `created_at`, `updated_at` on every table. Audit trail for free.
+  </Card>
+  <Card title="Constraints" icon="shield">
+    `nullable=False` where missing makes no sense. `unique=True` where it must be.
+  </Card>
+</CardGroup>
+
+## Walkthrough
+
+### Step 1 — Create the declarative base
+
+```python app/models/base.py
+"""SQLAlchemy declarative base for all models."""
+from datetime import datetime
+
+from sqlalchemy import DateTime, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """Parent class for all ORM models."""
+
+
+class TimestampMixin:
+    """Adds `created_at` and `updated_at` to any model that mixes it in."""
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+```
+
+### Step 2 — Create the Screening model
+
+```python app/models/screening.py
+"""Screening ORM model."""
+from uuid import UUID, uuid4
+
+from sqlalchemy import Boolean, Index, Integer, JSON, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base, TimestampMixin
+
+
+class Screening(Base, TimestampMixin):
+    __tablename__ = "screenings"
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+
+    site_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    candidate_initials: Mapped[str] = mapped_column(String(4), nullable=False)
+    age: Mapped[int] = mapped_column(Integer, nullable=False)
+    sex: Mapped[str] = mapped_column(String(1), nullable=False)
+    diagnosis: Mapped[str] = mapped_column(String(200), nullable=False)
+    medications: Mapped[list[str]] = mapped_column(JSON, default=list)
+
+    is_pregnant: Mapped[bool] = mapped_column(Boolean, default=False)
+    has_liver_disease: Mapped[bool] = mapped_column(Boolean, default=False)
+    in_other_trial: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="submitted", index=True)
+    eligibility_result: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    failed_criteria: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
+    subject_id: Mapped[str | None] = mapped_column(String(20), nullable=True, unique=True)
+
+    # Composite index for the most common list query
+    __table_args__ = (
+        Index("ix_screenings_site_status", "site_id", "status"),
+    )
+```
+
+### Step 3 — Auto-create tables in lifespan (temporary; Module 07 replaces with Alembic)
+
+```python app/main.py
+from app.database import engine
+from app.models.base import Base
+from app.models import screening as _screening_model  # ensure it's registered
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Dev convenience: create tables if missing.
+    # Production uses Alembic migrations (Module 07).
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database ready")
+    yield
+    await close_db()
+```
+
+### Step 4 — Update the create endpoint to persist
+
+```python app/routers/screenings.py
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.models.screening import Screening
+from app.schemas.screening import ScreeningCreate, ScreeningResponse
+
+router = APIRouter(prefix="/screenings", tags=["screenings"])
+
+
+@router.post("", response_model=ScreeningResponse, status_code=201)
+async def create_screening(payload: ScreeningCreate, db: AsyncSession = Depends(get_db)):
+    screening = Screening(**payload.model_dump())
+    db.add(screening)
+    await db.commit()
+    await db.refresh(screening)
+    return screening
+
+
+@router.get("", response_model=list[ScreeningResponse])
+async def list_screenings(
+    site_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(Screening).limit(limit)
+    if site_id:
+        stmt = stmt.where(Screening.site_id == site_id)
+    if status:
+        stmt = stmt.where(Screening.status == status)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/{screening_id}", response_model=ScreeningResponse)
+async def get_screening(screening_id: UUID, db: AsyncSession = Depends(get_db)):
+    screening = await db.get(Screening, screening_id)
+    if screening is None:
+        raise HTTPException(404, detail="Screening not found")
+    return screening
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`Mapped[int]` and `mapped_column(Integer, ...)`">
+    The 2.0 typed style. `Mapped[int]` tells the editor and Python the attribute type. `mapped_column(Integer, ...)` tells SQLAlchemy the SQL column. They must agree.
+  </Accordion>
+  <Accordion title="`server_default=func.now()` vs `default=datetime.utcnow`">
+    `server_default` makes the database insert the timestamp (`NOW()` in SQL). `default` makes Python insert it. Use `server_default` for timestamps — keeps clocks consistent across multiple workers.
+  </Accordion>
+  <Accordion title="`onupdate=func.now()`">
+    Tells the DB to set `updated_at` on every UPDATE statement, automatically. You write zero code to maintain it.
+  </Accordion>
+  <Accordion title="Composite index on (site_id, status)">
+    Our most common query is "list screenings for site X with status Y". A two-column index makes that lookup O(log n) instead of O(n). Indexes cost write speed; only add for *frequent* read patterns.
+  </Accordion>
+  <Accordion title="`from app.models import screening as _screening_model`">
+    Ugly but necessary: SQLAlchemy only knows about models that have been *imported* before `Base.metadata.create_all`. Without this import, the table never gets created.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart Uvicorn">
+    Logs: `Database ready`. The `enrollment.db` file now has the `screenings` table.
+  </Step>
+  <Step title="Submit a screening">
+    ```bash
+    curl -X POST http://localhost:8000/api/v1/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id":"SITE-001","candidate_initials":"AB","age":40,"sex":"F","diagnosis":"Type 2 Diabetes","medications":["metformin"]}'
+    ```
+    Returns the saved screening with a real UUID.
+  </Step>
+  <Step title="Restart the server, list screenings">
+    The screening is still there — *because it's actually in a database now*. (Try this with the in-memory dict version: it's gone.)
+  </Step>
+  <Step title="Inspect the DB">
+    ```bash
+    sqlite3 enrollment.db "SELECT id, site_id, status, created_at FROM screenings;"
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Why UUID instead of auto-increment integer?">
+    Three reasons: (1) **Privacy** — `/screenings/3` reveals you have ~3 screenings; UUID hides cardinality. (2) **Distributed-safe** — UUIDs can be generated client-side or across services without a single-counter bottleneck. (3) **Migration-safe** — merging two databases with overlapping integer IDs is painful; UUIDs collide effectively never.
+  </Accordion>
+  <Accordion title="Why `JSON` for the `medications` list?">
+    SQLite doesn't have an array type. JSON columns work everywhere. PostgreSQL has a real `ARRAY` type and `jsonb` — both better. We'll use a real Postgres array in Module 25 if you want.
+  </Accordion>
+  <Accordion title="Why no relationship to a `sites` table yet?">
+    We don't have one as a real table — `_SITES` is still hardcoded in the router. Module 08 (repository) and Module 17 (RBAC) make the case for moving it to the DB. For now, `site_id: str` with no FK is fine.
+  </Accordion>
+  <Accordion title="When should I add an index?">
+    On any column you `.where()` or `.order_by()` on **frequently**. Skip indexes on small tables (under ~10k rows, scan is fine). Composite indexes for combined filters (we have one for `site_id` + `status`).
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add a `Site` model. Move the hardcoded `_SITES` list into the database.
+
+    1. Create `app/models/site.py` with a `Site` model:
+       - `id: str` (primary key — store as `String(50)`, e.g., `"SITE-001"`)
+       - `name: str`
+       - `active: bool = True`
+       - Use `TimestampMixin` for created/updated.
+    2. Add a `_seed_sites()` function in `lifespan` that inserts the three default sites if the table is empty.
+    3. Update `app/routers/sites.py` to query the DB instead of the hardcoded list.
+
+    You'll write ~25 lines.
+  </Tab>
+  <Tab title="Hint">
+    ```python
+    # In lifespan, after create_all:
+    async with async_session() as db:
+        result = await db.execute(select(Site))
+        if not result.scalars().first():
+            db.add_all([
+                Site(id="SITE-001", name="Mass General", active=True),
+                ...
+            ])
+            await db.commit()
+    ```
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/06-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+# Restart, watch logs for "seeded 3 sites" (or your message)
+curl http://localhost:8000/api/v1/sites | python3 -m json.tool
+# Returns 3 sites — from DB now
+
+sqlite3 enrollment.db "SELECT * FROM sites;"
+```
+
+## Insight
+
+<Tip>
+  **Models and schemas are intentionally separate.** A `Screening` ORM model has 16 fields including audit timestamps and DB-only state. A `ScreeningResponse` schema has 7 fields — only what the API consumer needs. Coupling them (returning the ORM model directly without `response_model`) leaks DB internals to consumers and creates tight coupling that hurts both layers.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/models/` — examine `job.py`, `study.py`, `user.py`. Same patterns: typed declarative, timestamps mixin, composite indexes.
+
+## Next module
+
+<Card title="Module 07: Migrations (Alembic)" icon="rocket" href="/modules/07-migrations">
+  Stop using `create_all` (it can't evolve a real schema). Set up Alembic for proper migrations.
+</Card>

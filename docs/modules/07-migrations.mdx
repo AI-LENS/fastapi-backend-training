@@ -1,0 +1,290 @@
+---
+title: "07 · Migrations (Alembic)"
+description: "Safe schema evolution: init, autogenerate, upgrade, downgrade."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~5 lines · **Outcome:** Schema changes via versioned migrations. No more `create_all`.
+</Tip>
+
+## Concept
+
+`Base.metadata.create_all` got us started, but it has a fatal flaw: **it can't evolve.** Add a column to the model, and `create_all` does *nothing* to existing tables. You'd lose data on every change.
+
+**Alembic** is the migrations tool for SQLAlchemy. It generates Python scripts that describe schema changes (`add column`, `create table`, `drop index`...) and applies them in order, tracking what's been applied.
+
+```
+Models change ─► alembic revision --autogenerate ─► review the script ─► alembic upgrade head ─► DB is up to date
+```
+
+### What you commit to git
+
+| File | What it does |
+|---|---|
+| `alembic/versions/abc123_add_status.py` | One migration script per schema change |
+| `alembic.ini` | Config (DB URL, paths) |
+| `alembic/env.py` | Boilerplate that connects models to Alembic |
+
+Every team member runs the same migrations in the same order, so every environment converges to the same schema.
+
+## Walkthrough
+
+### Step 1 — Install and init
+
+```bash
+uv add alembic
+
+uv run alembic init alembic
+```
+
+This creates `alembic/`, `alembic.ini`, and `alembic/env.py`.
+
+### Step 2 — Configure `alembic.ini`
+
+Edit `alembic.ini` — find the `sqlalchemy.url` line (around line 60) and **comment it out**:
+
+```ini alembic.ini
+# sqlalchemy.url = driver://user:pass@localhost/dbname
+```
+
+We'll set the URL programmatically from settings.
+
+### Step 3 — Wire `env.py` to the models
+
+Replace `alembic/env.py`:
+
+```python alembic/env.py
+"""Alembic environment configuration."""
+import asyncio
+from logging.config import fileConfig
+
+from alembic import context
+from sqlalchemy import pool
+from sqlalchemy.engine import Connection
+from sqlalchemy.ext.asyncio import async_engine_from_config
+
+# Import all models so Alembic sees them
+from app.config import settings
+from app.models.base import Base
+import app.models.screening  # noqa: F401  ensure registration
+import app.models.site       # noqa: F401  (created in the Module 06 exercise)
+
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# Pull URL from settings, not from alembic.ini
+config.set_main_option("sqlalchemy.url", settings.db_url)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    context.configure(
+        url=settings.db_url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def do_run_migrations(connection: Connection) -> None:
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+async def run_migrations_online() -> None:
+    connectable = async_engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    async with connectable.connect() as connection:
+        await connection.run_sync(do_run_migrations)
+    await connectable.dispose()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    asyncio.run(run_migrations_online())
+```
+
+### Step 4 — Drop the old `create_all`
+
+In `app/main.py` lifespan, **remove** the `Base.metadata.create_all` block. Migrations now own the schema. (Keep the `_seed_sites()` call — that's data, not schema.)
+
+<Note>
+  This step assumes you completed the Module 06 exercise (which created `app/models/site.py` and `_seed_sites`). If you skipped it, do two things now: (a) drop the `import app.models.site` line above, and (b) remove the `await _seed_sites()` call in Step 7's lifespan — there's no `Site` table or seed function yet.
+</Note>
+
+### Step 5 — Generate your first migration
+
+```bash
+# Reset the dev DB so we start clean
+rm enrollment.db
+
+uv run alembic revision --autogenerate -m "create screenings and sites tables"
+```
+
+Open `alembic/versions/<hash>_create_screenings_and_sites_tables.py`. **Read it.** You should see `op.create_table("screenings", ...)` and `op.create_table("sites", ...)`. The `upgrade()` function applies the change; `downgrade()` reverses it.
+
+### Step 6 — Apply it
+
+```bash
+uv run alembic upgrade head
+```
+
+Tables are now in the DB. Restart Uvicorn — it should still work, but tables are managed by Alembic now.
+
+### Step 7 — Auto-run migrations on startup (production pattern)
+
+Add to lifespan:
+
+```python app/main.py
+import subprocess
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Run pending migrations on startup.
+    # Subprocess avoids nesting asyncio loops (Alembic's online mode uses asyncio.run).
+    result = subprocess.run(
+        ["alembic", "upgrade", "head"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        logger.error("Alembic failed: %s", result.stderr)
+        raise RuntimeError("Migration failed")
+    logger.info("Migrations up to date")
+
+    await _seed_sites()  # from Module 06 exercise
+    yield
+    # Shutdown — keep the engine-disposal call from Module 05.
+    await close_db()
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`async_engine_from_config(... poolclass=NullPool)`">
+    Alembic does its work in a single transaction; we don't need a connection pool. `NullPool` opens one connection and closes it cleanly — no pooling overhead.
+  </Accordion>
+  <Accordion title="`subprocess.run(['alembic', 'upgrade', 'head'])`">
+    Why subprocess? Alembic's `online` mode internally runs `asyncio.run(run_migrations_online())`. If we tried to call that from inside our async lifespan, we'd get "asyncio.run cannot be called from a running event loop". The subprocess sidesteps this.
+  </Accordion>
+  <Accordion title="`# noqa: F401`">
+    Tells linters not to flag "unused import". The imports are needed for their side effect (registering models with `Base.metadata`), even though we don't reference them.
+  </Accordion>
+  <Accordion title="What `--autogenerate` looks at">
+    Alembic compares two things: (1) `target_metadata` (the union of all imported model definitions) and (2) the live DB's current schema. The diff becomes the migration. If you forget to import a model, autogenerate misses it.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Add a column to a model">
+    In `app/models/screening.py`, add:
+
+    ```python
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    ```
+  </Step>
+  <Step title="Generate a migration">
+    ```bash
+    uv run alembic revision --autogenerate -m "add notes to screenings"
+    ```
+    Open the generated file. You'll see `op.add_column("screenings", sa.Column("notes", ...))`.
+  </Step>
+  <Step title="Apply it">
+    ```bash
+    uv run alembic upgrade head
+    ```
+  </Step>
+  <Step title="Roll it back">
+    ```bash
+    uv run alembic downgrade -1
+    ```
+    Column is gone. The migration's `downgrade()` function ran.
+  </Step>
+  <Step title="Apply it forward again">
+    ```bash
+    uv run alembic upgrade head
+    ```
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Should I always trust autogenerate?">
+    No. **Always read the script before applying.** Common gotchas: column type changes (e.g., String → Text) sometimes generate a drop+create instead of an alter; nullable changes need data migrations first; index renames may not be detected.
+  </Accordion>
+  <Accordion title="What if I edit a migration after applying it?">
+    Bad. Alembic tracks "which migrations have run" by hash. Editing means the hash changes; teammates' DBs that already ran the *old* version of the script are now in an undefined state. **Never edit applied migrations.** Create a new one.
+  </Accordion>
+  <Accordion title="What about downgrade scripts in production?">
+    Many teams write the upgrade carefully and leave downgrade as a no-op or "raise NotImplementedError". Production downgrades are exceptional and usually need data work, not just schema reversal. Your call — but never trust a downgrade you haven't tested.
+  </Accordion>
+  <Accordion title="What if two teammates create migrations on the same parent?">
+    You get a "merge head" — two heads. Run `alembic merge -m "merge migration_x and migration_y" <hash1> <hash2>` to create a merge migration. Then continue.
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add an **`enrolled_at: datetime | None`** field to the `Screening` model and migrate the change.
+
+    1. Add the field to `app/models/screening.py` (use `DateTime(timezone=True)`, nullable=True).
+    2. Generate a migration with a meaningful name.
+    3. Read the generated `upgrade()` and confirm it adds the column.
+    4. Apply it. Inspect the DB to verify.
+    5. Roll back to confirm `downgrade()` works.
+  </Tab>
+  <Tab title="Hint">
+    ```python
+    enrolled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    ```
+    Don't forget to import `datetime` from `datetime` and `DateTime` from `sqlalchemy`.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/07-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+sqlite3 enrollment.db ".schema screenings" | grep enrolled_at
+# Expect:  enrolled_at DATETIME
+
+alembic history
+# Shows your migration in the list with a description
+
+alembic current
+# Shows the head you're at
+```
+
+## Insight
+
+<Tip>
+  **A migration is a contract.** Once it's merged to `main`, it cannot change — your teammates will run it as-is. That's why reviewing the generated SQL before merging is non-negotiable. The biggest production outages from "I just added a column" come from mis-reviewed migrations (column rename interpreted as drop+create losing data).
+</Tip>
+
+## Real-world reference
+
+- `Final CRF Annotation/annotate-hub-api/alembic/` — production setup
+- `Final CRF Annotation/annotate-hub-api/app/main.py:31-40` — the same subprocess-based migration-on-startup pattern
+
+## Next module
+
+<Card title="Module 08: Repository pattern" icon="folder" href="/modules/08-repository-pattern">
+  Move all SQL out of routes into a clean repository layer.
+</Card>

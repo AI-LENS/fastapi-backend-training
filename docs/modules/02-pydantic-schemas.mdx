@@ -1,0 +1,252 @@
+---
+title: "02 · Pydantic schemas"
+description: "Replace bare dicts with validated request/response models. The contract layer."
+---
+
+<Tip>
+  **Time:** 45 min · **Code you'll write:** ~15 lines · **Outcome:** A `POST /screenings` endpoint that validates input, rejects bad data with 422, and returns a typed response.
+</Tip>
+
+## Concept
+
+Pydantic schemas are typed Python classes that:
+
+<CardGroup cols={3}>
+  <Card title="Validate input" icon="shield">
+    Wrong types or missing fields → automatic 422 response with field-level errors.
+  </Card>
+  <Card title="Document the API" icon="book">
+    `/docs` shows full request and response shapes — generated from the same classes.
+  </Card>
+  <Card title="Type the code" icon="code">
+    Your editor knows what fields exist; refactors are safer.
+  </Card>
+</CardGroup>
+
+### The architectural rule
+
+**Schemas are the API contract.** They live in `app/schemas/` and are different from DB models (`app/models/`, Module 06). Mixing them is the most common architectural mistake in beginner FastAPI codebases.
+
+| | Schema (Pydantic) | Model (SQLAlchemy) |
+|---|---|---|
+| Purpose | API contract | DB structure |
+| Lives in | `app/schemas/` | `app/models/` |
+| Has | Validation rules, examples | Columns, indexes, relationships |
+| Travels to | API consumers | The database |
+
+## Walkthrough
+
+### Step 1 — Create the schemas
+
+Create `app/schemas/__init__.py` (empty file) and `app/schemas/screening.py`:
+
+```python app/schemas/screening.py
+"""Pydantic schemas for the Screening resource."""
+from datetime import datetime
+from enum import Enum
+from uuid import UUID
+from pydantic import BaseModel, Field
+
+
+class Sex(str, Enum):
+    M = "M"
+    F = "F"
+
+
+class ScreeningCreate(BaseModel):
+    """Request body for creating a new screening."""
+    site_id: str = Field(..., examples=["SITE-001"])
+    candidate_initials: str = Field(..., min_length=1, max_length=4)
+    age: int = Field(..., ge=0, le=120)
+    sex: Sex
+    diagnosis: str = Field(..., examples=["Type 2 Diabetes"])
+    medications: list[str] = Field(default_factory=list)
+    is_pregnant: bool = False
+    has_liver_disease: bool = False
+    in_other_trial: bool = False
+
+
+class ScreeningResponse(BaseModel):
+    """What we return after creating or fetching a screening."""
+    id: UUID
+    site_id: str
+    candidate_initials: str
+    age: int
+    sex: Sex
+    status: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+```
+
+### Step 2 — Wire it into `main.py`
+
+```python app/main.py
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from fastapi import FastAPI
+
+from app.schemas.screening import ScreeningCreate, ScreeningResponse
+
+app = FastAPI(title="Subject Enrollment Service", version="0.2.0")
+
+# In-memory store. Module 05 replaces this with a real database.
+_screenings: dict[UUID, dict] = {}
+
+
+@app.get("/")
+def root():
+    return {"service": "Subject Enrollment Service", "status": "ok"}
+
+
+@app.post("/screenings", response_model=ScreeningResponse, status_code=201)
+def create_screening(payload: ScreeningCreate):
+    """Submit a new screening. Returns the created record."""
+    screening = {
+        "id": uuid4(),
+        "status": "submitted",
+        "created_at": datetime.utcnow(),
+        **payload.model_dump(),
+    }
+    _screenings[screening["id"]] = screening
+    return screening
+```
+
+### What's new
+
+<AccordionGroup>
+  <Accordion title="`Field(..., min_length=1, max_length=4)`">
+    `Field` adds validation and metadata to a field. The `...` means *required*. Constraints become part of the OpenAPI schema and enforced at runtime.
+  </Accordion>
+  <Accordion title="`Sex(str, Enum)` — why both `str` and `Enum`?">
+    Subclassing `str` makes JSON serialization "just work" — `Sex.M` becomes `"M"` in JSON, not `{"name": "M", "value": "M"}`. This is the Pydantic-recommended pattern.
+  </Accordion>
+  <Accordion title="`response_model=ScreeningResponse`">
+    Two effects: (1) FastAPI filters the response so only fields declared in `ScreeningResponse` are sent, and (2) `/docs` shows the response schema. Without it, the consumer has to guess the shape.
+  </Accordion>
+  <Accordion title="`model_config = {'from_attributes': True}`">
+    Tells Pydantic v2: *"You can build me from any object that has matching attributes"* — needed when the source is a SQLAlchemy model (Module 06+) or a `dict`.
+  </Accordion>
+  <Accordion title="`status_code=201`">
+    HTTP convention: `200` is the default for successful GET/PUT, `201 Created` for POST that creates a resource. Setting it explicitly makes intent clear and shows up in `/docs`.
+  </Accordion>
+</AccordionGroup>
+
+## Try it
+
+<Steps>
+  <Step title="Restart Uvicorn (if needed)">
+    `--reload` should auto-restart, but if you see import errors, kill and re-run.
+  </Step>
+  <Step title="Submit a valid screening">
+    ```bash
+    curl -X POST http://localhost:8000/screenings \
+      -H "Content-Type: application/json" \
+      -d '{
+        "site_id": "SITE-001",
+        "candidate_initials": "JD",
+        "age": 42,
+        "sex": "M",
+        "diagnosis": "Type 2 Diabetes",
+        "medications": ["metformin"]
+      }'
+    ```
+    You get a JSON response with `id`, `status: "submitted"`, and `created_at`.
+  </Step>
+  <Step title="Submit invalid data">
+    ```bash
+    curl -X POST http://localhost:8000/screenings \
+      -H "Content-Type: application/json" \
+      -d '{"site_id": "X", "age": 999, "sex": "Z", "diagnosis": "..."}'
+    ```
+    You get a **422** with field-level errors. **Never wrote that validation yourself.**
+  </Step>
+  <Step title="Look at /docs">
+    The endpoint now shows: request schema with all fields, types, constraints, and an example. Response schema with the typed shape.
+  </Step>
+</Steps>
+
+## Quick check
+
+<AccordionGroup>
+  <Accordion title="Why have separate `ScreeningCreate` and `ScreeningResponse` classes?">
+    They're different shapes. `ScreeningCreate` is what the *client sends* (no `id`, no `created_at` — server assigns those). `ScreeningResponse` is what the *server sends back* (omits the medical fields the consumer doesn't need to see). Mixing them is a classic anti-pattern that leaks fields.
+  </Accordion>
+  <Accordion title="What if I want a field to be optional?">
+    Use `field_name: str | None = None` (Python 3.10+ union) or `field_name: Optional[str] = None`. Both work; `| None` is more idiomatic.
+  </Accordion>
+  <Accordion title="How do I add custom validation (e.g., 'pregnant' incompatible with 'sex=M')?">
+    Use `@field_validator` or `@model_validator` from Pydantic v2:
+
+    ```python
+    from pydantic import model_validator
+
+    class ScreeningCreate(BaseModel):
+        sex: Sex
+        is_pregnant: bool
+
+        @model_validator(mode="after")
+        def male_cannot_be_pregnant(self):
+            if self.sex == Sex.M and self.is_pregnant:
+                raise ValueError("Male subjects cannot be pregnant")
+            return self
+    ```
+  </Accordion>
+  <Accordion title="What's the difference between `default_factory=list` and `= []`?">
+    `= []` shares one list across all instances (classic Python footgun). `default_factory=list` calls `list()` each time, making a fresh list per instance. **Always use `default_factory` for mutable defaults.**
+  </Accordion>
+</AccordionGroup>
+
+## Exercise
+
+<Tabs>
+  <Tab title="Task">
+    Add schemas for the **Site** resource and use them.
+
+    1. Create `app/schemas/site.py` with `SiteResponse(BaseModel)` having fields: `id: str`, `name: str`, `active: bool`. (We use `id` to match the DB primary key the Site model will have in Module 06; the URL path parameter stays `{site_id}`.)
+    2. Update your `GET /sites/{site_id}` handler from Module 01 to return a `SiteResponse` (use `response_model=`).
+    3. Add a new endpoint `GET /sites` that returns `list[SiteResponse]` for these hardcoded sites:
+       - `SITE-001` → "Mass General" (active)
+       - `SITE-002` → "Stanford Health" (active)
+       - `SITE-003` → "Old Site" (inactive)
+
+    You'll write **about 12 lines of code**.
+  </Tab>
+  <Tab title="Hint">
+    `response_model=list[SiteResponse]` works for the list endpoint. Build the list as a Python list of `SiteResponse(...)` instances or matching dicts.
+  </Tab>
+  <Tab title="Solution">
+    [Reveal solution →](/exercises/02-solution)
+  </Tab>
+</Tabs>
+
+## Verify
+```bash
+# List sites
+curl http://localhost:8000/sites
+# → JSON array of three sites
+
+# Get one
+curl http://localhost:8000/sites/SITE-001
+# → {"id": "SITE-001", "name": "Mass General", "active": true}
+
+# Confirm /docs shows the response schemas
+open http://localhost:8000/docs
+```
+
+## Insight
+
+<Tip>
+  **You'll never write input validation again.** Every constraint you express via `Field(..., ge=0, le=120)` becomes part of the OpenAPI spec, the runtime validator, and the docs — for free. This is the single biggest reason senior Python engineers reach for FastAPI.
+</Tip>
+
+## Real-world reference
+
+`Final CRF Annotation/annotate-hub-api/app/schemas/job.py` — the production version. Notice `JobCreate`, `JobResponse`, and `JobListResponse` follow the exact same pattern.
+
+## Next module
+
+<Card title="Module 03: Routers & params" icon="puzzle-piece" href="/modules/03-routers">
+  Split `main.py` into focused router files. Path/query/body params, status codes, tags.
+</Card>

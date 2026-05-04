@@ -1,0 +1,103 @@
+---
+title: "06 · Solution"
+description: "Site model + DB-backed sites router."
+---
+
+<Warning>Don't peek until you've tried.</Warning>
+
+## Files
+
+```python app/models/site.py
+"""Site ORM model."""
+from sqlalchemy import Boolean, String
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.models.base import Base, TimestampMixin
+
+
+class Site(Base, TimestampMixin):
+    __tablename__ = "sites"
+
+    id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+```
+
+```python app/main.py {3, 18-32}
+from sqlalchemy import select
+
+from app.database import async_session, engine
+from app.models.base import Base
+from app.models import screening as _screening_model
+from app.models import site as _site_model
+from app.models.site import Site
+
+
+async def _seed_sites():
+    async with async_session() as db:
+        result = await db.execute(select(Site))
+        if result.scalars().first() is None:
+            db.add_all([
+                Site(id="SITE-001", name="Mass General", active=True),
+                Site(id="SITE-002", name="Stanford Health", active=True),
+                Site(id="SITE-003", name="Old Site", active=False),
+            ])
+            await db.commit()
+            logger.info("Seeded 3 default sites")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    await _seed_sites()
+    logger.info("Database ready")
+    yield
+    await close_db()
+```
+
+```python app/routers/sites.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_db
+from app.models.site import Site
+from app.schemas.site import SiteResponse
+
+router = APIRouter(prefix="/sites", tags=["sites"])
+
+
+@router.get("", response_model=list[SiteResponse])
+async def list_sites(active: bool | None = None, db: AsyncSession = Depends(get_db)):
+    stmt = select(Site)
+    if active is not None:
+        stmt = stmt.where(Site.active == active)
+    result = await db.execute(stmt)
+    return result.scalars().all()
+
+
+@router.get("/{site_id}", response_model=SiteResponse)
+async def get_site(site_id: str, db: AsyncSession = Depends(get_db)):
+    site = await db.get(Site, site_id)
+    if site is None:
+        raise HTTPException(404, detail=f"Site {site_id} not found")
+    return site
+```
+
+No schema change is needed: since Module 02's exercise, `SiteResponse` already declares `id: str` with `from_attributes=True`, which lines up directly with the new `Site.id` column.
+
+## Notes
+
+<AccordionGroup>
+  <Accordion title="Why seed only when empty?">
+    Idempotent startup. If the seed already ran, restart shouldn't duplicate or overwrite anything.
+  </Accordion>
+  <Accordion title="Field name on the wire is `id`, path parameter is `site_id` — why?">
+    The Site DB table's primary key is `id` (matches every other table). The URL path parameter is `{site_id}` because at the screening level callers think "which site does this belong to?". The two are decoupled by the route handler — `def get_site(site_id: str): ...` then `db.get(Site, site_id)`.
+  </Accordion>
+</AccordionGroup>
+
+## Next
+
+<Card title="Module 07: Migrations" icon="rocket" href="/modules/07-migrations" />
