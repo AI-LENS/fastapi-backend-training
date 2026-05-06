@@ -3,24 +3,28 @@ title: "Quickstart"
 description: "Get the training environment running in 5 minutes."
 ---
 
-This project uses [**uv**](https://docs.astral.sh/uv/) — Astral's fast Python package manager. One tool installs Python, manages the venv, and resolves dependencies.
+This project uses two core CLI tools:
+
+- [**uv**](https://docs.astral.sh/uv/) installs Python, manages the venv, and resolves dependencies.
+- **Poe the Poet** is a lightweight task runner for repeatable project commands like starting the dev server.
 
 ## Prerequisites
 
 | Tool | Version | Check with |
 |---|---|---|
 | uv | 0.5+ | `uv --version` |
+| Poe the Poet | latest via project deps | `poe --version` |
 | Node.js (for Mintlify CLI) | 18+ | `node --version` |
-| A terminal | any | — |
-| An editor (VS Code, Cursor, etc.) | — | — |
+| A terminal | any | - |
+| An editor (VS Code, Cursor, etc.) | - | - |
 
 <Note>
-  If you don't have uv yet, install it once:
+  If you do not have uv yet, install it once:
   ```bash
   curl -LsSf https://astral.sh/uv/install.sh | sh
   # or: brew install uv  (macOS)
   ```
-  uv installs Python itself if you don't have it — no separate `python` install needed.
+  uv installs Python itself if you do not have it, so no separate `python` install is needed.
 </Note>
 
 ## Set up your workspace (build-from-scratch path)
@@ -31,29 +35,29 @@ This project uses [**uv**](https://docs.astral.sh/uv/) — Astral's fast Python 
     cd /Users/chaitanyapradeeprepaka/Desktop/Training/backend
     ```
   </Step>
-  <Step title="Initialize a uv project">
-    From the `app/` folder up — actually we already have a `pyproject.toml` ready. Just install:
+  <Step title="Install project and dev tools">
+    From the `app/` folder up, we already have a `pyproject.toml` ready. Just install:
 
     ```bash
-    uv sync
+    uv sync --group dev
     ```
 
-    `uv sync` reads `pyproject.toml`, creates a `.venv`, and installs everything into it. No manual venv creation, no `pip install`.
+    `uv sync --group dev` reads `pyproject.toml`, creates a `.venv`, and installs everything into it, including dev tools like **Poe the Poet**. No manual venv creation and no `pip install`.
   </Step>
   <Step title="Start the API server">
     ```bash
-    uv run uvicorn app.main:app --reload --port 8000
+    poe dev
     ```
 
-    `uv run` finds the project's venv automatically — **no activation needed**. `--reload` restarts on file save.
+    `uv run` finds the project's venv automatically, so no activation is needed. `poe dev` expands to the saved dev-server command, so you do not have to remember the full `uvicorn` invocation.
   </Step>
   <Step title="Verify the API">
     Open in your browser:
-    - [http://localhost:8000/](http://localhost:8000/) → JSON banner
-    - [http://localhost:8000/docs](http://localhost:8000/docs) → interactive Swagger UI
-    - [http://localhost:8000/redoc](http://localhost:8000/redoc) → alternative docs
+    - [http://localhost:8000/](http://localhost:8000/) -> JSON banner
+    - [http://localhost:8000/docs](http://localhost:8000/docs) -> interactive Swagger UI
+    - [http://localhost:8000/redoc](http://localhost:8000/redoc) -> alternative docs
 
-    If you see JSON and Swagger, you're good.
+    If you see JSON and Swagger, you are good.
   </Step>
 </Steps>
 
@@ -65,7 +69,7 @@ The complete working app lives in `final-app/`. Run it to see the goal state:
 cd final-app
 uv sync --group dev
 ENROLLMENT_SECRET_KEY=$(openssl rand -hex 32) uv run uvicorn app.main:app --port 8000
-# → http://localhost:8000/docs
+# -> http://localhost:8000/docs
 
 # In another terminal, run all tests
 cd final-app
@@ -102,8 +106,8 @@ Default users are seeded on first start:
 
 <Tip>
   Keep two terminal tabs open while you work:
-  - **Tab 1:** the API server (`uv run uvicorn app.main:app --reload`)
-  - **Tab 2:** anything else (running tests, curl, git…)
+  - **Tab 1:** the API server (`poe dev`)
+  - **Tab 2:** anything else (running tests, curl, git...)
 
   This way you always see API logs in one place.
 </Tip>
@@ -117,7 +121,24 @@ uv add pydantic-settings    # core dep
 uv add --group dev pytest   # dev/test dep
 ```
 
-`uv add` updates `pyproject.toml` AND installs the package in one step. No `pip install` + `requirements.txt` editing — uv handles both.
+`uv add` updates `pyproject.toml` and installs the package in one step. No `pip install` plus `requirements.txt` editing.
+
+## Saved project tasks with Poe
+
+This repo defines a `poe` task in `pyproject.toml`:
+
+```toml
+[tool.poe.tasks]
+dev = "uvicorn app.main:app --reload --reload-exclude=.venv,*.log"
+```
+
+That lets you run the server with:
+
+```bash
+poe dev
+```
+
+Use `poe` for commands you want the whole team to run the same way.
 
 ## Troubleshooting
 
@@ -125,17 +146,17 @@ uv add --group dev pytest   # dev/test dep
   <Accordion title="`command not found: uv`">
     Install it: `curl -LsSf https://astral.sh/uv/install.sh | sh` (you may need to restart your shell or `source ~/.zshrc`).
   </Accordion>
-  <Accordion title="`uv run uvicorn` says module not found">
-    Run `uv sync` first. uv won't auto-install missing deps when you `uv run`; the explicit sync step ensures the venv matches `pyproject.toml`.
+  <Accordion title="`poe dev` says `poe` was not found">
+    Run `uv sync --group dev` first. `poethepoet` is installed as a dev dependency, so a plain `uv sync` may skip it.
   </Accordion>
   <Accordion title="Port 8000 already in use">
-    Another process is on 8000. Either kill it (`lsof -i :8000` then `kill <PID>`) or use a different port: `uv run uvicorn app.main:app --reload --port 8001`.
+    Another process is on 8000. Either kill it (`lsof -i :8000` then `kill <PID>`) or run the underlying command manually on a different port: `uv run uvicorn app.main:app --reload --port 8001`.
   </Accordion>
   <Accordion title="Mintlify shows blank or error">
     Run `mintlify dev` from inside the `docs/` folder, not the project root. The CLI looks for `mint.json` in the current directory.
   </Accordion>
-  <Accordion title="I prefer plain pip / venv — can I still use this?">
-    Yes. `uv pip install -e .` (with the project's `pyproject.toml`) installs everything into your active venv classically. But the docs assume `uv run` and `uv sync` going forward.
+  <Accordion title="I prefer plain pip / venv - can I still use this?">
+    Yes. `uv pip install -e .` (with the project's `pyproject.toml`) installs everything into your active venv classically. But the docs assume `uv run`, `uv sync --group dev`, and `poe dev` going forward.
   </Accordion>
 </AccordionGroup>
 

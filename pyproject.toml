@@ -11,4 +11,9 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = []
+dev = [
+    "poethepoet>=0.30.0",
+]
+
+[tool.poe.tasks]
+dev = "uvicorn app.main:app --reload --reload-exclude=.venv,*.log"

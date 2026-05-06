@@ -16,7 +16,7 @@ FastAPI is a **Python web framework** for building APIs. Three things matter on 
     A single `FastAPI()` instance is your application. Routes attach to it.
   </Card>
   <Card title="Route handlers" icon="code">
-    Python functions decorated with `@app.get(...)` etc. — they handle HTTP requests.
+    Python functions decorated with `@app.get(...)` etc. handle HTTP requests.
   </Card>
   <Card title="Auto-generated docs" icon="book">
     FastAPI reads your function signatures and generates Swagger UI for free at `/docs`.
@@ -25,17 +25,17 @@ FastAPI is a **Python web framework** for building APIs. Three things matter on 
 
 ### Why FastAPI (vs Flask, Django, etc.)
 
-- **Type-driven** — your function's type hints become the API contract
-- **Async-native** — `async def` is first-class, not bolted on
-- **OpenAPI built in** — Swagger UI and ReDoc come free
-- **Pydantic for validation** — request bodies validate themselves (Module 02)
+- **Type-driven** - your function's type hints become the API contract
+- **Async-native** - `async def` is first-class, not bolted on
+- **OpenAPI built in** - Swagger UI and ReDoc come free
+- **Pydantic for validation** - request bodies validate themselves (Module 02)
 
 ### What's an "ASGI" app?
 
 You'll see this term. WSGI is the old Python web standard (synchronous, one request at a time per worker). **ASGI** is the modern async-friendly version. FastAPI is an ASGI app, and `uvicorn` is the ASGI server that runs it.
 
 ```
-HTTP request → Uvicorn (ASGI server) → FastAPI app → your function → response
+HTTP request -> Uvicorn (ASGI server) -> FastAPI app -> your function -> response
 ```
 
 ## Walkthrough
@@ -45,7 +45,7 @@ We're starting with the simplest possible app: one endpoint, no database, no sch
 Open `app/main.py`:
 
 ```python app/main.py
-"""Subject Enrollment Service — entry point."""
+"""Subject Enrollment Service - entry point."""
 from fastapi import FastAPI
 
 app = FastAPI(
@@ -57,7 +57,7 @@ app = FastAPI(
 
 @app.get("/")
 def root():
-    """Service banner — also acts as a basic liveness check."""
+    """Service banner - also acts as a basic liveness check."""
     return {
         "service": "Subject Enrollment Service",
         "version": "0.1.0",
@@ -78,10 +78,10 @@ def root():
     A **decorator** that registers the next function as the handler for `GET /`. Other verbs: `@app.post`, `@app.put`, `@app.delete`, `@app.patch`.
   </Accordion>
   <Accordion title="`def root():`">
-    The handler function. The name doesn't matter for routing — the decorator does the routing. Convention: name it after what it does.
+    The handler function. The name does not matter for routing; the decorator does the routing. Convention: name it after what it does.
   </Accordion>
   <Accordion title="`return { ... }`">
-    Return a dict. FastAPI converts it to JSON automatically and sets `Content-Type: application/json`. (Later we'll return Pydantic models for proper schemas.)
+    Return a dict. FastAPI converts it to JSON automatically and sets `Content-Type: application/json`. Later we return Pydantic models for proper schemas.
   </Accordion>
 </AccordionGroup>
 
@@ -90,15 +90,15 @@ def root():
 <Steps>
   <Step title="Sync dependencies">
     ```bash
-    uv sync
+    uv sync --group dev
     ```
-    Reads `pyproject.toml` and installs into a managed `.venv` — no activation needed.
+    Reads `pyproject.toml` and installs into a managed `.venv` with the dev tools included. We use **Poe the Poet** for saved project commands, so install the dev group here.
   </Step>
   <Step title="Start the server">
     ```bash
-    uv run uvicorn app.main:app --reload --port 8000
+    poe dev
     ```
-    `uv run` runs the command inside the project's venv automatically. The path `app.main:app` means *"in the file `app/main.py`, find the variable named `app`"*.
+    `uv run` runs the command inside the project's venv automatically. Here `poe dev` is a saved task that starts `uvicorn` with reload enabled, so you do not need to retype the full server command each time.
   </Step>
   <Step title="Hit the root endpoint">
     In another terminal:
@@ -108,12 +108,12 @@ def root():
     You should see your JSON banner.
   </Step>
   <Step title="Open the auto-generated docs">
-    Browser → [http://localhost:8000/docs](http://localhost:8000/docs)
+    Browser -> [http://localhost:8000/docs](http://localhost:8000/docs)
 
     You'll see Swagger UI with one endpoint listed. Click it, click **Try it out**, click **Execute**. The response shows up live.
   </Step>
   <Step title="Look at ReDoc too">
-    [http://localhost:8000/redoc](http://localhost:8000/redoc) — the same OpenAPI spec, rendered differently. Some teams prefer this for read-only API documentation.
+    [http://localhost:8000/redoc](http://localhost:8000/redoc) -> the same OpenAPI spec, rendered differently. Some teams prefer this for read-only API documentation.
   </Step>
 </Steps>
 
@@ -124,10 +124,10 @@ def root():
     **No.** The URL is determined by the decorator argument (`@app.get("/")`), not the function name. You could call it `pneumonoultramicroscopicsilicovolcanoconiosis` and the route would still be `/`.
   </Accordion>
   <Accordion title="What happens if I write `@app.post('/')` instead of `@app.get('/')`?">
-    `GET /` would return a 405 *Method Not Allowed*. `POST /` would work but you can't easily test it from a browser address bar — you'd need `curl -X POST` or Swagger UI.
+    `GET /` would return a 405 *Method Not Allowed*. `POST /` would work but you cannot easily test it from a browser address bar; you would need `curl -X POST` or Swagger UI.
   </Accordion>
   <Accordion title="Why do I need `--reload` when running uvicorn?">
-    Without it, Uvicorn loads `main.py` once and ignores edits. With `--reload`, the server watches files and restarts on save. Use it in development; **never** in production (it's expensive and not safe under load).
+    Without it, Uvicorn loads `main.py` once and ignores edits. With `--reload`, the server watches files and restarts on save. Use it in development; **never** in production.
   </Accordion>
   <Accordion title="Where does `/docs` come from? I didn't write it.">
     FastAPI ships with two built-in routes: `/docs` (Swagger UI) and `/redoc` (ReDoc). Both render the OpenAPI schema FastAPI generates from your code at `/openapi.json`. You can disable them in production by passing `docs_url=None, redoc_url=None` to `FastAPI()`.
@@ -154,7 +154,7 @@ def root():
     }
     ```
 
-    Use a hard-coded `name` for now — we'll wire up real data in later modules.
+    Use a hard-coded `name` for now. We'll wire up real data in later modules.
 
     **Constraints:**
     - Must use a path parameter (`{site_id}` in the route)
@@ -185,9 +185,9 @@ def root():
     Inside, return a dict with three keys: `site_id`, `name`, `active`. The first echoes the parameter; the other two are hard-coded.
   </Tab>
   <Tab title="Solution">
-    Don't peek until you've tried.
+    Do not peek until you've tried.
 
-    [Reveal solution →](/exercises/01-solution)
+    [Reveal solution ->](/exercises/01-solution)
   </Tab>
 </Tabs>
 
@@ -211,7 +211,7 @@ After you save your changes (Uvicorn should auto-reload), run these and confirm 
     curl http://localhost:8000/sites/SITE-042
     ```
 
-    The `site_id` field in the response should change to `"SITE-042"`. The other fields stay the same (we hard-coded them).
+    The `site_id` field in the response should change to `"SITE-042"`. The other fields stay the same.
   </Step>
   <Step title="Check the auto-docs">
     Refresh [http://localhost:8000/docs](http://localhost:8000/docs). You should now see **two** endpoints. The new one shows the `site_id` parameter is required and is a string.
@@ -221,7 +221,7 @@ After you save your changes (Uvicorn should auto-reload), run these and confirm 
 ## Insight
 
 <Tip>
-  **The OpenAPI spec was generated from your type hints.** Notice how `/docs` knew that `site_id` is a string and required — because you wrote `site_id: str` in the function signature. This is the foundation of FastAPI: types → contract → docs → validation. We'll lean on this hard in Module 02.
+  **The OpenAPI spec was generated from your type hints.** Notice how `/docs` knew that `site_id` is a string and required because you wrote `site_id: str` in the function signature. This is the foundation of FastAPI: types -> contract -> docs -> validation. We'll lean on this hard in Module 02.
 </Tip>
 
 ## Real-world reference
@@ -232,7 +232,7 @@ In the production AnnotateHub API, the equivalent of `app/main.py` is:
 /Users/chaitanyapradeeprepaka/Desktop/Final CRF Annotation/annotate-hub-api/app/main.py
 ```
 
-It's longer because it adds CORS, lifespan, routers, etc. — but the core `app = FastAPI(...)` pattern is identical. By Module 04 your `main.py` will look very similar.
+It's longer because it adds CORS, lifespan, routers, etc., but the core `app = FastAPI(...)` pattern is identical. By Module 04 your `main.py` will look very similar.
 
 ## What's next
 
