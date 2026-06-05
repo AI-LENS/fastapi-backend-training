@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-import structlog
 from fastapi import Depends, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -59,11 +58,6 @@ async def get_current_user(
     user = await user_repo.get_by_id(db, payload["sub"])
     if user is None or not user.is_active:
         raise Unauthorized("User not found or disabled")
-    structlog.contextvars.bind_contextvars(
-        user_id=str(user.id),
-        user_role=user.role,
-        site_id=user.site_id,
-    )
     return user
 
 

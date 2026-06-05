@@ -4,7 +4,6 @@ from __future__ import annotations
 from contextvars import ContextVar
 from uuid import uuid4
 
-import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 
 
@@ -15,14 +14,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         rid = request.headers.get("x-request-id") or str(uuid4())
         token = request_id_var.set(rid)
-        structlog.contextvars.bind_contextvars(request_id=rid)
         try:
             response = await call_next(request)
             response.headers["X-Request-ID"] = rid
             return response
         finally:
             request_id_var.reset(token)
-            structlog.contextvars.clear_contextvars()
 
 
 def get_request_id() -> str | None:

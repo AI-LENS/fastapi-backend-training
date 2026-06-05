@@ -81,7 +81,6 @@
       "group": "Part G — Testing",
       "pages": [
         "modules/22-unit-tests",
-        "modules/22b-contract-load-security-tests",
         "modules/23-integration-tests"
       ]
     },
@@ -141,7 +140,6 @@
         "exercises/20-solution",
         "exercises/21-solution",
         "exercises/22-solution",
-        "exercises/22b-solution",
         "exercises/23-solution",
         "exercises/24-solution",
         "exercises/25-solution",

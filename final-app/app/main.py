@@ -86,7 +86,7 @@ async def _seed_sites() -> None:
     async with async_session() as db:
         inserted = await site_repository.seed(db, DEFAULT_SITES)
         if inserted:
-            logger.info("seeded sites", count=inserted)
+            logger.info("seeded sites count=%s", inserted)
 
 
 async def _seed_users() -> None:
@@ -96,12 +96,12 @@ async def _seed_users() -> None:
             for u in _default_users():
                 db.add(u)
             await db.commit()
-            logger.info("seeded users", emails=["admin@example.com", "alice@example.com", "bob@example.com"])
+            logger.info("seeded users: %s", ["admin@example.com", "alice@example.com", "bob@example.com"])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("startup", **settings.safe_dump())
+    logger.info("startup: %s", settings.safe_dump())
 
     # For training simplicity we use create_all on startup.
     # Module 07 teaches Alembic, the production-grade migration tool.
@@ -145,11 +145,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     async def handle_domain_error(request: Request, exc: DomainError):
         domain_errors_total.labels(code=exc.code).inc()
         logger.info(
-            "domain_error",
-            method=request.method,
-            path=request.url.path,
-            code=exc.code,
-            message=exc.message,
+            "domain_error method=%s path=%s code=%s message=%s",
+            request.method, request.url.path, exc.code, exc.message,
         )
         return JSONResponse(
             status_code=exc.status_code,

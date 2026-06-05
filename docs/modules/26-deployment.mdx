@@ -232,7 +232,7 @@ Same idea on AWS ECS, Cloud Run — different YAML, same concepts.
     A liveness check that hits the DB will fail every time the DB has a hiccup. Result: all containers restart simultaneously, no DB to talk to, infinite restart loop. Liveness should only verify "the Python process is responsive" — heavier checks belong in readiness.
   </Accordion>
   <Accordion title="`workers = CPUs × 2 + 1`">
-    Gunicorn's recommended formula for I/O-bound workloads. For pure CPU-bound, use `workers = CPUs`. For mixed (most FastAPI), the formula is fine. Tune based on actual load testing (Module 22b).
+    Gunicorn's recommended formula for I/O-bound workloads. For pure CPU-bound, use `workers = CPUs`. For mixed (most FastAPI), the formula is fine. Tune based on actual load testing.
   </Accordion>
   <Accordion title="`max_requests = 1000` — what's that?">
     Each worker handles 1000 requests then restarts. Defends against memory leaks (yours or in deps). The `_jitter` prevents all workers from restarting at the same time.

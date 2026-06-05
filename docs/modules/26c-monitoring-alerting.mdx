@@ -278,7 +278,7 @@ After resolution, document:
     Add a `grafana` service. Import the Prometheus data source. Build a dashboard from the `enrollment_*` metrics.
   </Step>
   <Step title="Drill: simulate an alert">
-    Run the load test from Module 22b at 200 users. Watch p99 climb. If it exceeds 500ms for 10 minutes, the alert fires (in your Prometheus + Alertmanager setup).
+    Simulate load at 200 concurrent users (e.g. with `locust` or `wrk`). Watch p99 climb. If it exceeds 500ms for 10 minutes, the alert fires (in your Prometheus + Alertmanager setup).
   </Step>
 </Steps>
 
